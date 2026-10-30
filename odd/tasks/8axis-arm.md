@@ -1,69 +1,93 @@
-# Feature: 8-axis 3D robotic arm control (Mega 2560 + PCA9685 + 8x MG946R)
+# Feature: 6-DOF Kinematic Control System (7x MG946R + AUX + PCA9685 + Arduino Mega 2560)
 
-Branch `feat/arm-8axis` · Delivery: local feature branch, work-unit commits (`exception-ok`: no git remote configured, PR chain not applicable) · Test runner: `python -m unittest discover -s host/tests -v` + `arduino-cli compile --fqbn arduino:avr:mega firmware/mega2560_arm`.
+Branch `feat/arm-8axis` · Delivery: local feature branch, work-unit commits (`exception-ok`: no git remote configured) · Test runner: `python -m pytest tests/ host/tests/ -v` + `arduino-cli compile --fqbn arduino:avr:mega firmware_mega`.
 
 ## Specs
 
-S1 — Firmware without external libraries. The sketch must build for `arduino:avr:mega` using only `<Wire.h>` plus the AVR core; no `Adafruit_PWMServoDriver.h`. The PCA9685 (`0x40`) is driven through its own registers: `MODE1 0x00`, `PRESCALE 0xFE`, `LED0_ON_L 0x06`.
+S1 — Native PCA9685 Firmware (`firmware_mega/firmware_mega.ino`). Builds for `arduino:avr:mega` using only `<Wire.h>` and AVR core (no external libraries). PCA9685 at `0x40`, 50 Hz (`PRESCALE = 121`), `SDA` -> Pin 20, `SCL` -> Pin 21, `PIN_OE` -> Pin 2 (`LOW` = active, `HIGH` = physical emergency stop). Dual UART: `Serial` (USB, `115200`) and `Serial1` (pins 18/19, `115200`).
 
-S2 — Dual serial input. Commands are accepted on `Serial` (USB, `115200`) and on `Serial1` (pins `18 TX1` / `19 RX1`, `115200`) so an ESP32 can act as a wireless bridge. A reply goes to the port that sent the command; unsolicited events go to both.
+S2 — Physical Motor Map (1 to 7 from Gripper to Base, plus 8 AUX):
+- Motor 1 (Channel 0) `PINZA`: Gripper jaws ($\theta_6 \in [0^\circ, 100^\circ]$).
+- Motor 2 (Channel 1) `GIRO_PINZA`: Wrist roll ($\theta_5 \in [0^\circ, 360^\circ]$).
+- Motor 3 (Channel 2) `INCLINA_PINZA`: Wrist pitch ($\theta_4 \in [-90^\circ, +90^\circ]$, $0^\circ$ kinematic = $90^\circ$ vertical servo).
+- Motor 4 (Channel 3) `CODO`: Elbow pitch ($\theta_3 \in [-90^\circ, +90^\circ]$).
+- Motor 5 (Channel 4) `HOMBRO_IZQ`: Shoulder master ($\theta_2 \in [15^\circ, 165^\circ]$).
+- Motor 6 (Channel 5) `HOMBRO_DER`: Shoulder slave coupled to Motor 5. Default `SHOULDER_COUPLING = +1` (same spatial orientation), configurable to `-1` (`180 - deg` mirror) via serial command or JSON without recompiling. Synchronized in the same I2C tick (< 1 ms delta).
+- Motor 7 (Channel 6) `BASE`: Base turntable yaw ($\theta_1 \in [0^\circ, 360^\circ]$).
+- Motor 8 (Channel 7) `AUX`: Spare channel.
 
-S3 — Emergency stop is physical. `PIN_OE = 2`; `HIGH` disables the PCA9685 outputs and is the boot state. The board must boot with OE `HIGH`, then print `{"status":"READY","board":"MEGA2560_PCA9685"}`.
+S3 — `HOME` Zero Posture:
+- Physically vertical pointing straight up: $\theta_1 = 0^\circ$, $\theta_2 = 90^\circ$, $\theta_3 = 0^\circ$, $\theta_4 = 0^\circ$, $\theta_5 = 0^\circ$, $\theta_6 = 50\%$.
 
-S4 — Required command set (protocol v1, preserved verbatim; `<motor>` is the user motor number 1..8, `<ch>` where shown is the PCA9685 channel):
-- `I` — I2C diagnostic. On success prints `{"status":"OK","pca9685":"CONECTADO_0x40"}`; on failure prints an error with the Wire code and the hint `Verificar SDA->Pin20 y SCL->Pin21`.
-- `S` — emergency stop: neutral pulses + `{"event":"EMERGENCY_STOP","oe":"HIGH"}`, latched until `R`.
-- `R` — enable: `{"event":"ENABLED","oe":"LOW"}`.
-- `F` — all neutral `{"event":"ALL_NEUTRAL"}`.
-- `M<motor>:<deg>` — angle move with smooth ramp, `{"ack":"M_OK","motor":<n>,"deg":<deg>}`.
-- `P<motor>:<pulse>` — raw 12-bit pulse, `{"ack":"P_OK"}`.
-- `T<motor>:<offset>:<ms>` — timed continuous rotation: `offset` is a signed velocity offset from the stop pulse, verbatim "`<velocidad_-150_a_150>`", applied for `ms`, then back to the stop pulse, `{"ack":"T_OK"}`. Absolute pulse positioning uses `P`, never `T`.
-- `C<motor>:<pulse>` — calibrate the stop/neutral pulse, `{"ack":"CALIBRATED"}`.
+S4 — Non-blocking 50 Hz Motion Engine & Serial Protocol (`115200` baud):
+- Tick every 20 ms (`millis()`), no blocking `delay()` during motion. Supports positional servos (trapezoidal/linear interpolation) and 360° continuous servos (timed pulse activation $\Delta t$ ms with automatic return to `servoStop[ch]`).
+- Commands:
+  - `I` -> I2C scanner (`{"status":"OK","pca9685":"CONECTADO_0x40"}`).
+  - `S` -> Emergency stop (`PIN_OE = HIGH` + all channels to `servoStop`).
+  - `R` -> Enable outputs (`PIN_OE = LOW`).
+  - `H` -> Go to vertical `HOME` ($90^\circ$).
+  - `G:<m1>,<m2>,<m3>,<m4>,<m5>,<m7>,<tiempo_ms>` -> Coordinated multi-axis move in `tiempo_ms` (Motor 6 computed automatically from `m5` via `SHOULDER_COUPLING`).
+  - `T<motor>:<offset_pwm>:<ms>` -> Timed 360° spin with automatic brake to `servoStop` when `ms` expires.
+  - `C<motor>:<pulso_stop>:<deg_per_sec>` (also accepts `C<motor>:<pulso_stop>`) -> Hot calibration of neutral pulse and angular speed.
+  - `U<+1|-1>` / `J6` -> Configure `SHOULDER_COUPLING` (`+1` same direction, `-1` mirror `180 - deg`).
+  - `Q` -> JSON telemetry with current estimated state of the motors.
+  - Preserves backward-compatible `M<motor>:<deg>[:<ms>]`, `P<motor>:<pulse>`, `F`, `V`.
 
-S5 — Official mapping, user numbering 1..7 from the end effector to the base (supersedes the first channel map). Commands address the MOTOR number, the firmware converts internally (`channel = motor - 1`):
-- Motor 1 -> channel 0 `PINZA` (gripper)
-- Motor 2 -> channel 1 `GIRO_PINZA` (wrist roll)
-- Motor 3 -> channel 2 `INCLINA_PINZA` (wrist pitch)
-- Motor 4 -> channel 3 `CODO` (elbow)
-- Motor 5 -> channel 4 `HOMBRO_IZQ` (left shoulder, master)
-- Motor 6 -> channel 5 `HOMBRO_DER` (right shoulder, mirrored slave)
-- Motor 7 -> channel 6 `BASE` (waist yaw)
-- Motor 8 -> channel 7 `AUX` (spare)
+S5 — 6-Stage SE(3) Mathematical Model (`src/kinematics_6dof.py` & `config/config_geometria.json`):
+- Configurable geometry: `L1 = 115.0`, `L2 = 145.0`, `L3 = 135.0`, `L4 = 55.0`, `d5 = 45.0`, `L6_finger = 75.0` mm.
+- Chained $4 \times 4$ homogeneous transforms $T_0^6 = T_0^1(\theta_1) \cdot T_1^2(\theta_2) \cdot T_2^3(\theta_3) \cdot T_3^4(\theta_4) \cdot T_4^5(\theta_5) \cdot T_5^6(\theta_6)$.
+- `forward_kinematics(thetas_deg)`: returns individual matrices $[T_0^1 \dots T_5^6]$, global $T_0^6$, TCP `[X, Y, Z]` in mm, orientation `[Pitch, Roll, Yaw]`, gripper opening in mm, and 3D positions of all intermediate joints.
+- `inverse_kinematics(x, y, z, pitch_deg, roll_deg, grip_percent)`: analytical Elbow-Up solver + Jacobian ($6 \times 5$) Damped Least Squares refinement, plus `move_linear_xyz` Cartesian waypoint interpolation and Workspace & Collision Guard ($Z \ge 10\text{ mm}$ for elbow, wrist, and TCP; max radius check).
 
-S5b — Double shoulder mechanical rule, verbatim: "Nunca debe moverse en el mismo sentido que el Motor 5; siempre trabaja acoplado en espejo (`Angulo_M6 = 180 - Angulo_M5`, o velocidad invertida respecto a `servoStop` si opera en modo 360° continuo)." Moving either motor 5 or 6 moves both, synchronized; direct commands to 6 are accepted but immediately reconciled. `Y<6>:255` keeps the pair linked only when the installer verifies the opposite mounting (`J6` toggles invert if the two servos face the same way).
+S6 — Real-Time Odometry, Persistent State & Interactive Calibration (`src/state_manager.py`, `src/calibrate_servos.py`, `robot_state.json`):
+- Persists angles of motors 1..7, current `(X, Y, Z)`, `(Pitch, Roll, Yaw)`, $T_0^6$, `shoulder_coupling` (`+1` or `-1`), per-motor `stop_pulse` and `deg_per_sec`, and bounded command history.
+- Enforces shoulder coupling invariant so channels 4 and 5 never receive contradictory commands.
+- Interactive calibration assistant (`src/calibrate_servos.py`) for finding deadband stop pulse (`305`..`310`), verifying Motor 5/6 coupling sign (`+1` vs `-1`), and measuring angular speed (`deg_per_sec`).
 
-S6 — 360° and 180° support in the same firmware. Neutral/stop is `307` at 50 Hz; positional travel is `110` (~540 µs, 0°) to `500` (~2440 µs, 180°). Mode `P` = positional (angle), mode `C` = continuous (pulse/time). An `M` command on a `C` channel must be rejected with an error that points to `T`.
+S7 — Automated QA Test Suite (`tests/test_kinematics_and_protocol.py`):
+- Test 1 (`HOME` identity): at initial vertical posture, $X \approx 0, Y \approx 0, Z = L_1 + L_2 + L_3 + L_4 + d_5 + L_6 = 570.0\text{ mm}$.
+- Test 2 (FK <-> IK consistency): 1000 random reachable poses across $360^\circ$; positional error $< 0.5\text{ mm}$.
+- Test 3 (Shoulder coupling): no function can emit contradictory commands to PCA9685 channels 4 and 5.
+- Test 4 (Table collision guard): requesting $Z = -20\text{ mm}$ raises a controlled exception before sending any serial bytes.
 
-S7 — PCA9685 timing: 50 Hz (`PRESCALE 121`), 12-bit, `MODE1` auto-increment `0xA0`, 16 channels available, 8 used.
-
-S8 — Non-blocking motion. Motion is advanced from `loop()`; no `delay()` of user-controlled length inside a command. `S` must take effect immediately even while a long move or a `T` rotation is in progress. `S` while latched only re-acknowledges.
-
-S9 — Safety and calibration: angular limits per channel, watchdog (`W<ms>`, `K` keepalive) that neutralizes and disables on timeout, EEPROM persistence (`E` save, `D` defaults), mirror/slave link for `HOMBRO_DER` motor 6 from `HOMBRO_IZQ` motor 5 (`Y<ch>:<src>`, default `Y6:5`) with invert (`J<ch>`, default enabled), so the paired shoulder tracks the master automatically.
-
-S10 — Host controller in Python 3 with `pyserial`, real-time over USB serial: joint names from config, `status`, `move`, `pulse`, `spin`, `estop`, `enable`, `neutral`, `home`, `pose`, `calibrate`, `monitor`, `repl`, `script`, `ports`, `scan`, `doctor`. Must also work against a simulated device (`--sim`) with no hardware, and support a TCP transport for the ESP32 bridge.
-
-S11 — ESP32/ESP32-C3 bridge firmware: transparent TCP server that forwards bytes to `Serial1` at `115200`, so the host controller can reach the Mega wirelessly with the same protocol.
-
-S12 — Tooling: one script compiles and uploads with `arduino-cli` (auto-detected from the Arduino IDE install or `PATH`), default port `COM4`, FQBN `arduino:avr:mega`.
+S8 — Hardware Integrator, CLI & AI Agent API (`src/agent_controller.py`):
+- Auto-detects Arduino Mega COM port on Windows (`COM4`), compiles/flashes `firmware_mega/firmware_mega.ino` via `arduino-cli`, verifies `I` (`CONECTADO_0x40`), and exposes:
+  - `get_current_pose()`
+  - `move_to_xyz(x_mm, y_mm, z_mm, pitch_deg, roll_deg, speed_mm_s)`
+  - `rotate_wrist(roll_deg_360)`
+  - `set_gripper(open_percent)`
+  - `pick_and_place(origin_xyz, target_xyz, approach_height_mm)`
+  - `emergency_stop()`
 
 ## Tasks
 
 | ID | Specs | Route | Status | Commit |
 |----|-------|-------|--------|--------|
-| T1 | S1-S9 | delegated (firmware writer) | todo | — |
-| T2 | S10 | delegated (host writer) | todo | — |
-| T3 | S11 | delegated (bridge writer) | todo | — |
-| T4 | S12 + docs | inline (parent) | todo | — |
-| T5 | all | inline + independent verifier (firmware high risk) | todo | — |
+| T1 | S1-S4 | delegated (Sub-Agent 1: `firmware_mega/firmware_mega.ino`) | done | `59d8592` |
+| T2 | S5 | delegated (Sub-Agent 2: `src/kinematics_6dof.py` + `config/config_geometria.json`) | done | `fb4727c` |
+| T3 | S6 | delegated (Sub-Agent 3: `src/state_manager.py` + `src/calibrate_servos.py`) | done | `a74ff1e` |
+| T4 | S7 | delegated (Sub-Agent 4: `tests/test_kinematics_and_protocol.py`) | done | `ad3436b` |
+| T5 | S8 | delegated (Sub-Agent 5: `src/agent_controller.py`) | done | `8f88005` |
+| T6 | S1-S8 | inline + independent verifier (`opencode-go/iceman-contributor-free`, all S1-S8 PASS) | done | `ad3436b` |
 
 ## Log
 
-L1 — User brief (condensed; the verbatim requirement fragments live in `## Specs`): 8-axis 3D-printed arm, Arduino Mega 2560 R3, PCA9685 at 50 Hz over hardware I2C (`SDA 20`, `SCL 21`), 8x MG946R, 5 V/27 A servo rail isolated from the Mega, OE on pin 2, commands `M` / `P` / `T` / `C` / `I` / `S` / `R` / `F`, dual `Serial` + `Serial1`, host controller over USB, ESP32 bridge prepared.
+L1 — User initial brief: 8-axis 3D-printed arm, Arduino Mega 2560 R3, PCA9685 at 50 Hz over hardware I2C (`SDA 20`, `SCL 21`), 8x MG946R, 5 V/27 A servo rail isolated from the Mega, OE on pin 2.
 
-L2 — 2026-10-29: Workspace `Proyecto predeterminado` cannot create files or directories from the shell (ACL deny). User chose `C:\Users\merca\Documentos\brazo-8ejes`. Session moved there.
+L2 — 2026-10-29: Workspace moved to `C:\Users\merca\Documentos\brazo-8ejes` due to ACL deny in OneDrive folder.
 
-L3 — 2026-10-29: Toolchain detected: arduino-cli 1.5.1 (bundled with Arduino IDE 2), `arduino:avr` 1.8.8, `esp32:esp32` 3.3.12, Python 3.14.3 with pyserial 3.5, CH340 on `COM4`.
+L3 — 2026-10-29: Toolchain detected: `arduino-cli 1.5.1`, `arduino:avr 1.8.8`, `esp32:esp32 3.3.12`, Python 3.14.3 with `pyserial 3.5`, `numpy 2.3.5`, `pytest 9.0.3`, CH340 on `COM4`.
 
-L4 — 2026-10-29: Firmware boots with OE disabled (S3) instead of enabling at the end of `setup()` as in the user's base sketch: sending 90° to eight positional servos at power-up is a mechanical risk. The host sends `R` on connect, so `README`/protocol docs and the CLI document this.
+L4 — 2026-10-29: Firmware boots with OE disabled (`HIGH`) so nothing jerks at power-up.
 
-L5 — 2026-10-29 (supersedes S5, changes S4/S5b/S6/S9): user supplied the real harness order, motors 1..7 from the gripper to the base, plus motor 8 `AUX` on channel 7. Verbatim rules: "El usuario numera los motores del 1 al 7 comenzando desde el extremo efector (la pinza) hasta la base fija"; "Motor 6 (Canal 5 PCA9685) - HOMBRO_DER (Shoulder Right - Esclavo Invertido)"; "Nunca debe moverse en el mismo sentido que el Motor 5; siempre trabaja acoplado en espejo (Angulo_M6 = 180 - Angulo_M5, o velocidad invertida respecto a servoStop si opera en modo 360° continuo)"; "`T<motor_1_a_7>:<velocidad_-150_a_150>:<ms>` -> Modo 360° continuo seguro". Consequence: commands address motor numbers, `T` is a signed velocity offset, and the shoulder pair is 5/6 (channels 4/5).
+L5 — 2026-10-29: User supplied motor order 1..7 from gripper to base + 8 AUX.
+
+L6 — 2026-10-30: User supplied the Master Multi-Agent Orchestration Prompt for the 6-DOF Kinematic Control System:
+- 5 specialized sub-agents required:
+  1. `firmware_mega/firmware_mega.ino` (50 Hz `millis()` non-blocking engine, `SHOULDER_COUPLING = +1` default configurable to `-1`, commands `I`, `S`, `R`, `H`, `G:<m1>,<m2>,<m3>,<m4>,<m5>,<m7>,<tiempo_ms>`, `T<motor>:<offset_pwm>:<ms>`, `C<motor>:<pulso_stop>:<deg_per_sec>`, `Q`).
+  2. `src/kinematics_6dof.py` + `config/config_geometria.json` (`RobotArm6DOF`, 6 homogeneous transforms $T_0^1 \dots T_5^6$, `L1=115, L2=145, L3=135, L4=55, d5=45, L6_finger=75`, analytical Elbow-Up IK + 6x5 Jacobian DLS + `move_linear_xyz` + collision guard $Z \ge 10\text{ mm}$).
+  3. `src/state_manager.py` + `src/calibrate_servos.py` (`robot_state.json` real-time state matrix, shoulder coupling enforcement, interactive calibration assistant).
+  4. `tests/test_kinematics_and_protocol.py` (HOME identity $Z=570\text{ mm}$, 1000-point FK<->IK $<0.5\text{ mm}$, shoulder coupling guard, table collision guard at $Z=-20\text{ mm}$).
+  5. `src/agent_controller.py` (COM auto-detection, `arduino-cli` compile/flash, `get_current_pose`, `move_to_xyz`, `rotate_wrist`, `set_gripper`, `pick_and_place`, `emergency_stop`).
+
+L7 — 2026-10-30: User clarified: "es solamantes el planteamiento no esta conectado el mega". Do not flash or block on physical serial hardware; verify firmware compilation via `arduino-cli compile` and run `agent_controller.py` / QA tests in simulation / offline verification mode.
