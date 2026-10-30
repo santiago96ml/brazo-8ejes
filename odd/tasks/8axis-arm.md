@@ -69,6 +69,29 @@ S9 — Vision Node (Netbook Conectar Igualdad / Ubuntu Server) & Read-First / Ze
   3. Silently preloading the PWM registers on the PCA9685 while `PIN_OE` remains `HIGH`.
   4. Lowering `PIN_OE` to `LOW` (`R`) ONLY after verifying software-hardware angle match, achieving a 100% jerk-free startup.
 
+S10 — Windows performance environment (`config/env_performance.py`):
+- Imported at the top of every vision entry point, sets `OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS=0`, `OPENCV_VIDEOIO_PRIORITY_DSHOW=100`, `OMP_NUM_THREADS=4`, `OPENBLAS_NUM_THREADS=4`, `CUDA_MODULE_LOADING=LAZY`, `YOLO_VERBOSE=False` before NumPy/OpenCV import.
+
+S11 — Zero-lag multi-threaded USB capture (`src/fast_camera.py`):
+- `FastUSBCamera` opens `cv2.VideoCapture(index, cv2.CAP_DSHOW)`, forces `MJPG` FOURCC before width/height/FPS (`1280x720` or `1920x1080` at `30/60`), `CAP_PROP_BUFFERSIZE=1`, optional short manual exposure (`CAP_PROP_AUTO_EXPOSURE` / `CAP_PROP_EXPOSURE=-6`).
+- A daemon thread always keeps ONLY the newest frame; `get_latest_frame()` returns `(frame, timestamp_ns, fps_real)` in `< 0.2 ms` with no queue backlog.
+
+S12 — Hybrid blue-arm visual analyzer (`src/arm_vision_analyzer.py`):
+- Mode 1 geometric: HSV segmentation of the blue printed links + black MG946R joint boxes, PCA/contour principal axes, 2D/3D kinematic skeleton (Base → Shoulder → Elbow → Wrist → Gripper) and live angles `[theta1..theta6]` relative to the table horizontal.
+- Mode 2 fiducial: `DICT_4X4_50` ArUco markers on the links take priority with sub-degree trigonometry.
+- Mode 3 neural: `KeypointNeuralPredictor` loads `models/arm_keypoints.onnx` (cv2.dnn) or `yolov8n-pose.pt`/`yolo11n-pose.pt` (ultralytics) when available, predicting the 6 joint points.
+- Returns one normalized result dict with `thetas_deg`, `motors_deg`, `keypoints_px`, `skeleton`, `cartesian_mm`, `T_0_6`, `confidence`, `latency_ms`.
+
+S13 — Dataset auto-recorder (`src/dataset_recorder.py`):
+- Saves `dataset/images/NNNNNN.jpg` at capture resolution and `dataset/labels/NNNNNN.txt` in normalized YOLO keypoints format (class cx cy w h, then 6x x y v), plus a sidecar `.json` with `thetas_deg`, `motors_deg`, `T_0_6`, `cartesian_mm`.
+
+S14 — Live monitoring HUD (`src/live_vision_hud.py`):
+- OpenCV window at camera rate showing skeleton, per-joint angles, live TCP `[X, Y, Z]` mm from the 6 matrices, `OE` state (`HIGH [SAFE]` / `LOW [ACTIVE]`), FPS and latency.
+- Keys: `SPACE` emergency stop (`S`), `Z` zero/real-state in $T_0^6$, `G` save dataset sample.
+
+S15 — Pulse odometry bridge (`src/pulse_odometry.py`):
+- Converts PCA9685 pulse ↔ motor degrees ↔ kinematic thetas for all 8 motors using the calibrated `pulse_min`/`pulse_stop`/`pulse_max` and `home` anchoring, with shoulder coupling (motor 6 = master if coupling +1, else `180 - master`).
+
 ## Tasks
 
 | ID | Specs | Route | Status | Commit |
@@ -80,6 +103,11 @@ S9 — Vision Node (Netbook Conectar Igualdad / Ubuntu Server) & Read-First / Ze
 | T5 | S8 | delegated (Sub-Agent 5: `src/agent_controller.py`) | done | `8f88005` |
 | T6 | S1-S8 | inline + independent verifier (`opencode-go/iceman-contributor-free`, all S1-S8 PASS) | done | `ad3436b` |
 | T7 | S9 + S1-S8 | delegated (5 Sub-Agents on `opencode-go/*`: Zero-Jump Boot `OE=HIGH`, `src/vision_locator.py`, pitch interpolation in `move_linear_xyz`, QA `test_06`, live `COM4` upload & demo) | done | `HEAD` |
+| T8 | S10-S11 | delegated (Fast camera: `config/env_performance.py` + `src/fast_camera.py` + tests) | todo | — |
+| T9 | S12 | delegated (Analyzer: `src/arm_vision_analyzer.py` + tests) | todo | — |
+| T10 | S13-S14 | delegated (Recorder + HUD: `src/dataset_recorder.py` + `src/live_vision_hud.py` + tests) | todo | — |
+| T11 | S15 | delegated (Pulse odometry: `src/pulse_odometry.py` + tests) | todo | — |
+| T12 | S10-S15 | inline (camera index scan, 100-frame benchmark, pytest, live HUD smoke) | todo | — |
 
 ## Log
 
