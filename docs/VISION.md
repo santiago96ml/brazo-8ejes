@@ -1,4 +1,4 @@
-# Vision pipeline
+﻿# Vision pipeline
 
 Real-time vision for the 6-DOF arm on this Windows PC.
 
@@ -6,7 +6,7 @@ Real-time vision for the 6-DOF arm on this Windows PC.
 
 | Index | Device | Use |
 |---|---|---|
-| 0 | Trust USB Camera (VID_145F:PID_0203) | **arm camera** — points at the shelf where the arm lives |
+| 0 | Trust USB Camera (VID_145F:PID_0203) | **arm camera** â€” points at the shelf where the arm lives |
 | 1 | HP Wide Vision HD Camera (integrated) | laptop webcam, not used |
 | 2 | NVIDIA virtual camera | black frames, ignore |
 
@@ -120,83 +120,95 @@ All coordinates normalized to [0,1]; `v = 2` visible, `1` low confidence, `0` mi
 `dataset/images/000001.jpg` is the raw frame and `000001.json` carries
 `thetas_deg`, `motors_deg`, `T_0_6`, `cartesian_mm`, timestamp and source mode.
 
+
 ## UVC colour control and CLAHE
 
-`FastUSBCamera` accepts `auto_wb`, `wb_temperature`, `saturation`,
-`brightness`, `contrast`, `gain` and `sharpness`; they are applied after the
-format negotiation and are best-effort (MSMF silently ignores unsupported controls).
-Recommended starting point for the blue cast:
+`FastUSBCamera` accepts `auto_wb`, `wb_temperature`, `saturation`, `brightness`,
+`contrast`, `gain` and `sharpness`; they are applied after format negotiation and are
+best-effort (MSMF silently ignores unsupported controls). Recommended start for the
+blue cast:
 
-`python
+```python
 FastUSBCamera(index=0, auto_wb=0, wb_temperature=4600, saturation=160)
-`
+```
 
-On the analyzer side, `ArmVisionAnalyzer(use_clahe=True)` (default) applies CLAHE
-on the LAB `L` channel at segmentation resolution. Measured on the saved real
-frame: the blue mask drops from 166 212 px to 88 464 px (less wall bleed) while the
-skeleton stays identical, and steady-state analysis costs ~21 ms instead of ~18 ms.
+`ArmVisionAnalyzer(use_clahe=True)` (default) applies CLAHE on the LAB `L` channel at
+segmentation resolution. Measured on the saved real frame: the blue mask drops from
+166 212 px to 88 464 px (less wall bleed) with an identical skeleton, and steady-state
+analysis costs ~21 ms instead of ~18 ms.
 
 ## Camera-guided pulse calibration
 
-src/visual_pulse_calibrator.py closes the loop between the camera, the Mega and
-the 360-degree servos:
+`src/visual_pulse_calibrator.py` closes the loop camera -> Mega -> servos:
 
-`powershell
+```powershell
 # Dry run: no serial, no camera, prints the plan
 python -m src.visual_pulse_calibrator --dry-run --motors 2 --json
 
 # Real calibration of one motor (camera index 0, Mega on COM4)
 python -m src.visual_pulse_calibrator --port COM4 --camera 0 --motor 2
-`
+```
 
-Stages per motor: S (OE HIGH) -> vision read -> Z:... preload -> R;
-then a 304..311 sweep picking the pulse with the smallest pixel displacement
-(< 0.35 px/s), then two 200 ms bursts to measure deg_per_ms_pos and
-deg_per_ms_neg. Results are written to config/servo_pulse_profile.json and
-pushed to the Mega (C<motor>:<stop>:<dps> + E). Motors 5 and 6 are calibrated
-as one pair (master 5, mirrored 6).
+Stages per motor: `S` (OE HIGH) -> vision read -> `Z:...` preload -> `R`; then a
+304..311 sweep picking the pulse with the smallest pixel displacement (< 0.35 px/s),
+then two 200 ms bursts to measure `deg_per_ms_pos` / `deg_per_ms_neg`. Results go to
+`config/servo_pulse_profile.json` and to the Mega (`C<motor>:<stop>:<dps>` + `E`).
+Motors 5 and 6 are calibrated as one pair (master 5, mirrored 6). A dry run never
+writes the profile.
 
 **The camera is exclusive**: close any open HUD window before calibrating, otherwise
 MSMF opens the device but cannot grab frames.
 
 ## Dataset collection and YOLO11-pose training
 
-`powershell
+```powershell
 python tools\auto_collect_dataset.py --camera 0 --count 100 --out dataset --inpaint
 python tools\train_arm_keypoints.py --dataset dataset --epochs 100 --imgsz 640 --model yolo11n-pose.pt --export-onnx
-`
+```
 
-uto_collect_dataset.py walks 100 deterministic safe poses (radius 120..320 mm,
+`auto_collect_dataset.py` walks 100 deterministic safe poses (radius 120..320 mm,
 Z 200..520 mm, pitch 30..80 deg), requires at least 4 ArUco markers, optionally
-inpaints the marker squares so the network learns the blue link and black servo,
-and writes image + YOLO-keypoint label + JSON sidecar through DatasetRecorder.
+inpaints the marker squares so the network learns the blue link and the black servo,
+and writes image + YOLO-keypoint label + JSON sidecar through `DatasetRecorder`.
 
-	rain_arm_keypoints.py builds dataset/arm_pose.yaml (kpt_shape: [6, 3],
-keypoints ase, shoulder, elbow, wrist_pitch, wrist_roll, gripper_tip), trains
-yolo11n-pose.pt, and exports models/arm_keypoints.onnx for
-ArmVisionAnalyzer(mode="neural").
+`train_arm_keypoints.py` builds `dataset/arm_pose.yaml` (`kpt_shape: [6, 3]`,
+keypoints `base, shoulder, elbow, wrist_pitch, wrist_roll, gripper_tip`), trains
+`yolo11n-pose.pt`, and exports `models/arm_keypoints.onnx`.
 
-### Current host prerequisite (checked on 2026-10-30)
+### Host status (verified 2026-10-30)
 
-`	ext
-torch          2.12.0+cpu   -> CUDA unavailable in this Python environment
-ultralytics    not installed
-GPU            NVIDIA RTX 4050 Laptop 6 GB (driver 616.92)
-`
+```text
+torch          2.14.1+cu126   CUDA 12.6, RTX 4050 Laptop visible
+torchvision    0.29.1+cu126
+ultralytics    8.4.194
+onnx / onnxruntime installed
+```
 
-Training therefore cannot run yet. Install the CUDA build and ultralytics:
+Smoke test on 12 synthetic images, `imgsz=320`, 1 epoch:
 
-`powershell
-python -m pip install --upgrade ultralytics
-python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision
-`
+```text
+CUDA:0 (NVIDIA GeForce RTX 4050 Laptop GPU, 6140MiB)
+1 epoch completed in 8.2 s of training batch
+weights/best.pt 5.6 MB
+ONNX export OK (22.6 s)
+```
 
-python -c "from tools.train_arm_keypoints import check_environment; print(check_environment())"
-reports readiness and prints the same hint.
+That proves dataset -> train -> export works on the GPU. The model itself is
+meaningless because the images are synthetic; real training needs the ArUco-labelled
+dataset.
+
+Python 3.14 CUDA wheels exist only under the **cu126** index; cu124 has no cp314
+build and `pip install torch` from it silently keeps the CPU wheel. Pin explicitly:
+
+```powershell
+python -m pip install --index-url https://download.pytorch.org/whl/cu126 --no-deps --force-reinstall torch==2.14.1+cu126 torchvision==0.29.1+cu126
+```
+
+`KeypointNeuralPredictor` loads only `models/arm_keypoints.onnx` or
+`models/arm_keypoints.pt`. A generic COCO `yolo11n-pose.pt` is never auto-loaded:
+its keypoints are human joints and would silently poison `mode="hybrid"`.
 
 ## Keyboard jog (teleoperation)
-
-The HUD now doubles as a teleoperation panel:
 
 | Key | Action |
 |---|---|
@@ -209,10 +221,9 @@ The HUD now doubles as a teleoperation panel:
 | `Q` / `ESC` | quit |
 
 Positional joints send `M<motor>:<deg>:400` (3 deg step, clamped 0..180 by the
-firmware). Continuous joints cannot hold an angle, so they send a timed burst
-`T<motor>:<offset>:150` (offset +/-40). The mode comes from `config/arm.json`
-(`mode` field, default `P`).
+firmware). Continuous joints send a timed burst `T<motor>:<offset>:150` (+/-40).
+The mode comes from `config/arm.json` (`mode`, default `P`).
 
-The HUD prints `controls are SIMULATED` at startup unless `--port COM4` is
-passed; the overlay also prefixes `SIM (no hardware)` so nobody mistakes a
-simulated E-STOP for a real one.
+The HUD prints `controls are SIMULATED` at startup unless `--port COM4` is passed;
+the overlay prefixes `SIM (no hardware)` so nobody mistakes a simulated E-STOP for a
+real one.

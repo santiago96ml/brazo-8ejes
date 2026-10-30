@@ -67,12 +67,14 @@ class KeypointNeuralPredictor:
                 return
         except Exception:
             self._onnx_net = None
-        # 2. ultralytics YOLO pose
+        # 2. ultralytics YOLO pose: ONLY an arm-specific fine-tuned checkpoint.
+        # A generic COCO yolo*-pose.pt predicts human joints and would silently
+        # poison hybrid mode, so it is never picked up by filename.
         try:
             import ultralytics  # noqa: F401
             from ultralytics import YOLO
 
-            for fname in ("yolov8n-pose.pt", "yolo11n-pose.pt"):
+            for fname in (self.model_path.replace(".onnx", ".pt"), "models/arm_keypoints.pt"):
                 if os.path.exists(fname):
                     self._yolo = YOLO(fname)
                     return

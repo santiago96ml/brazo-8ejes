@@ -15,7 +15,7 @@ if REPO_ROOT not in sys.path:
 
 PIP_HINT = (
     "python -m pip install --upgrade ultralytics\n"
-    "python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision"
+    "python -m pip install --index-url https://download.pytorch.org/whl/cu126 torch torchvision"
 )
 
 KEYPOINT_NAMES = ("base", "shoulder", "elbow", "wrist_pitch", "wrist_roll", "gripper_tip")

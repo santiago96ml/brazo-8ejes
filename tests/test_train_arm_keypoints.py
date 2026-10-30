@@ -67,7 +67,13 @@ def test_check_environment():
     env = check_environment()
     for key in ("torch", "cuda", "ultralytics", "device", "ready", "hint"):
         assert key in env
-    assert env["ready"] is False
+    assert isinstance(env["ready"], bool)
+    assert isinstance(env["cuda"], bool)
+    # ready is a property of the host, not of the test: assert the contract only.
+    if env["cuda"] and env["ultralytics"]:
+        assert env["ready"] is True
+    else:
+        assert env["ready"] is False
 
 
 def test_train_missing_ultralytics(monkeypatch):
