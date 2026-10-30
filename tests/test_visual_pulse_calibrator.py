@@ -66,14 +66,17 @@ class _FakeCamera:
 
 
 class _FakeAnalyzer:
-    def __init__(self):
+    def __init__(self, moving: bool = True):
         self.t = 0
+        self.moving = moving
 
     def analyze(self, frame):
         self.t += 1
-        # keypoints moving deterministically
+        # keypoints move every frame when the joint is supposed to be moving;
+        # stay perfectly still to model a joint parked at its stop pulse.
+        offset = (self.t % 10) if self.moving else 0
         kps = {}
-        base_x = 40 + self.t % 10
+        base_x = 40 + offset
         kps["base"] = (base_x, 200, 0.9)
         kps["shoulder"] = (base_x + 30, 150, 0.9)
         kps["elbow"] = (base_x + 60, 100, 0.9)
@@ -136,7 +139,7 @@ class TestVisualPulseCalibrator(unittest.TestCase):
 
     def test_calibrate_motor_emits_C_and_E(self):
         cam = _FakeCamera()
-        ana = _FakeAnalyzer()
+        ana = _FakeAnalyzer(moving=False)
         ctrl = type("C", (), {})()
         ctrl.transport = _FakeTransport()
         ctrl.state = type("S", (), {"update_from_thetas": lambda self, t: None})()
@@ -145,6 +148,20 @@ class TestVisualPulseCalibrator(unittest.TestCase):
         sent = " ".join(str(s) for s in ctrl.transport.sent)
         self.assertTrue(any(str(s).startswith("C1:") for s in ctrl.transport.sent))
         self.assertTrue(any(str(s).strip() == "E" for s in ctrl.transport.sent))
+
+    def test_calibrate_motor_refuses_when_joint_never_stills(self):
+        cam = _FakeCamera()
+        ana = _FakeAnalyzer(moving=True)
+        ctrl = type("C", (), {})()
+        ctrl.transport = _FakeTransport()
+        ctrl.state = type("S", (), {"update_from_thetas": lambda self, t: None})()
+        cal = VisualPulseCalibrator(camera=cam, analyzer=ana, controller=ctrl, dry_run=False)
+        res = cal.calibrate_motor(1)
+        self.assertFalse(res.get("ok", True))
+        self.assertFalse(res.get("valid", True))
+        self.assertFalse(any(str(s).startswith("C1:") for s in ctrl.transport.sent))
+        self.assertFalse(any(str(s).strip() == "E" for s in ctrl.transport.sent))
+        self.assertNotIn("1", cal._profile["motors"])
 
     def test_dry_run_sends_nothing(self):
         cam = _FakeCamera()

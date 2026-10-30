@@ -377,7 +377,9 @@ class VisualPulseCalibrator:
         except Exception:
             pass
         confidence = 1.0 if best_disp < self.stop_epsilon_px_s else max(0.0, 1.0 - best_disp)
-        return {"motor": motor, "stop_pulse": best_pulse, "displacement_px_s": float(best_disp), "samples": samples_all, "confidence": float(confidence)}
+        valid = best_disp < self.stop_epsilon_px_s
+        return {"motor": motor, "stop_pulse": best_pulse, "displacement_px_s": float(best_disp),
+                "samples": samples_all, "confidence": float(confidence), "valid": bool(valid)}
 
     def measure_speed(self, motor: int, delta_pwm: int | None = None, burst_ms: int | None = None) -> dict:
         if motor in (5, 6):
@@ -451,6 +453,8 @@ class VisualPulseCalibrator:
         if motor in (5, 6):
             # calibrate master 5 and mirror to 6
             res5 = self.calibrate_motor(5) if motor == 6 else self._calibrate_motor_master(5)
+            if not res5.get("valid", False):
+                return res5
             coupling = 1
             if self.state is not None:
                 try:
@@ -486,6 +490,15 @@ class VisualPulseCalibrator:
 
     def _calibrate_motor_master(self, motor: int) -> dict:
         stop_res = self.measure_stop_point(motor)
+        if not stop_res.get("valid", False):
+            # No candidate produced a still joint: the tracker is measuring noise
+            # (servo unpowered, wrong joint tracked, or motor not moving at all).
+            # Never write a guessed stop pulse to EEPROM or to the profile.
+            merged = dict(stop_res)
+            merged.update({"motor": motor, "ok": False,
+                           "reason": "no_stop_candidate_below_threshold",
+                           "hint": "check servo power, joint visibility and tracker target"})
+            return merged
         speed_res = self.measure_speed(motor)
         stop_p = stop_res["stop_pulse"]
         dps = speed_res.get("deg_per_ms_pos") or speed_res.get("deg_per_ms_neg") or 0.0
@@ -503,6 +516,7 @@ class VisualPulseCalibrator:
         merged["motor"] = motor
         merged["stop_pulse"] = stop_p
         merged["dps"] = dps
+        merged["ok"] = True
         self._profile["motors"][str(motor)] = {"stop_pulse": stop_p, "deg_per_ms_pos": speed_res.get("deg_per_ms_pos"), "deg_per_ms_neg": speed_res.get("deg_per_ms_neg"), "displacement_px_s": stop_res.get("displacement_px_s"), "confidence": stop_res.get("confidence")}
         return merged
 
