@@ -18,3 +18,5 @@ desktop.ini
 tools/camera_previews/
 tools/aruco_sheet.png
 dataset/
+dataset_smoke/
+logs/
