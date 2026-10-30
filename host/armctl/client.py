@@ -14,10 +14,10 @@ class ArmController:
         self.watchdog_ms = watchdog_ms
         self.state_callback = state_callback
         self.keep_enabled = keep_enabled
-        # Default policy: leave the arm enabled/holding on clean exit; the
-        # firmware watchdog neutralizes after keepalives stop. Sending F/S is
-        # opt-in via --disable.
         self.disable_on_exit = bool(disable_on_exit) and not keep_enabled
+        self._last_sent = None
+        self._first_wait_done = False
+        self._first_retry_done = False
         self._reply_queue = queue.Queue()
         self._stop = threading.Event()
         self._dispatcher = threading.Thread(target=self._dispatch, daemon=True)
@@ -62,6 +62,7 @@ class ArmController:
             time.sleep(interval)
 
     def send_line(self, line):
+        self._last_sent = line
         self.transport.send_line(line)
 
     def wait_ack(self, expected, timeout=2.0):
@@ -77,6 +78,26 @@ class ArmController:
                 found = item
             else:
                 pending.append(item)
+        # retry first command once on serial transport timeout
+        if found is None and not self._first_wait_done and not self._first_retry_done:
+            if self._last_sent is not None:
+                time.sleep(0.3)
+                try:
+                    self.transport.send_line(self._last_sent)
+                except Exception:
+                    pass
+                self._first_retry_done = True
+                deadline = time.time() + timeout
+                while time.time() < deadline and found is None:
+                    try:
+                        item = self._reply_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if self._matches(item, expected):
+                        found = item
+                    else:
+                        pending.append(item)
+        self._first_wait_done = True
         for p in pending:
             self._reply_queue.put(p)
         return found

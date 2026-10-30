@@ -26,7 +26,7 @@ def _make_transport(args, cfg):
         return TcpTransport(host, int(port))
     port = args.port or cfg.get("port", "COM4")
     baud = args.baud or cfg.get("baud", 115200)
-    return SerialTransport(port, baud)
+    return SerialTransport(port, baud, reset_wait=not getattr(args, "no_reset_wait", False))
 
 
 def _wrap(args, cfg, state_cb=None):
@@ -83,6 +83,7 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--no-enable", action="store_true")
     parser.add_argument("--disable", action="store_true", help="on exit send F then S (disable board)")
+    parser.add_argument("--no-reset-wait", action="store_true", help="skip waiting for board READY after opening serial port")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ports
@@ -492,6 +493,8 @@ def _do_doctor(args, cfg):
         print("port check error: %s" % e)
     try:
         ctrl = _wrap(args, cfg)
+        transport = ctrl.transport
+        print("ready_wait: %s" % ("OK" if getattr(transport, "ready_seen", True) else "TIMEOUT"))
         ctrl.send_line("V")
         r = ctrl.wait_ack("VERSION", 2.0)
         ctrl.close()
@@ -632,47 +635,79 @@ def _do_repl(args, cfg):
 
 def _do_script(args, cfg):
     ctrl = _wrap(args, cfg)
+    json_mode = getattr(args, "json", False)
+    cmds = 0
+    errors = 0
     try:
         with open(args.file, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        for i, raw in enumerate(lines, 1):
+        for raw in lines:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
             if line.lower().startswith("wait "):
                 ms = int(line.split()[1])
+                if json_mode:
+                    print(json.dumps({"event": "wait", "ms": ms}))
+                else:
+                    print(".. wait %d" % ms)
                 time.sleep(ms / 1000.0)
                 continue
-            if line.lower().startswith("move "):
-                parts = line.split()
-                idx = _resolve_joint(cfg, parts[1])
-                ctrl.send_line(cmd_move(cfg["joints"][idx].get("motor", idx+1), float(parts[2])))
-                r = ctrl.wait_ack("M_OK", 2.0)
-                if r is None:
-                    print("ERROR line %d: no ack" % i)
-                    return 1
+            # resolve joint / build line
+            try:
+                if line.lower().startswith("move "):
+                    parts = line.split()
+                    idx = _resolve_joint(cfg, parts[1])
+                    send = cmd_move(cfg["joints"][idx].get("motor", idx + 1), float(parts[2]))
+                elif line.lower().startswith("pose goto "):
+                    name = line.split()[2]
+                    poses = load_poses()
+                    pose = poses.get(name)
+                    if pose is None:
+                        raise ValueError("unknown pose %s" % name)
+                    moves = pose_to_moves(cfg, pose)
+                    send = cmd_multi([(cfg["joints"][m[0]].get("motor", m[0] + 1), m[1]) for m in moves]) if moves else None
+                else:
+                    send = line
+            except Exception as e:
+                errors += 1
+                if json_mode:
+                    print(json.dumps({"event": "error", "line": line, "error": str(e)}))
+                else:
+                    print("ERROR: %s" % e)
                 continue
-            # pose goto shortcut
-            if line.lower().startswith("pose goto "):
-                name = line.split()[2]
-                poses = load_poses()
-                pose = poses.get(name)
-                if pose is None:
-                    print("ERROR line %d: unknown pose" % i)
-                    return 1
-                moves = pose_to_moves(cfg, pose)
-                if moves:
-                    ctrl.send_line(cmd_multi([(cfg["joints"][m[0]].get("motor", m[0] + 1), m[1]) for m in moves]))
-                    r = ctrl.wait_ack("X_OK", 2.0)
-                    if r is None:
-                        print("ERROR line %d: no ack" % i)
-                        return 1
+            if send is None:
                 continue
-            # raw protocol
-            ctrl.send_line(line)
-            # determine expected ack from first char
+            cmds += 1
+            if json_mode:
+                print(json.dumps({"event": "send", "line": send}))
+            else:
+                print(">> %s" % send)
+            ctrl.send_line(send)
+            # determine ack
             time.sleep(0.05)
-        return 0
+            r = None
+            # try common acks
+            for code in ("M_OK", "X_OK", "P_OK", "T_OK", "HOME", "STATE", "OK"):
+                r = ctrl.wait_ack(code, 0.2)
+                if r is not None:
+                    break
+            if r is None:
+                errors += 1
+                if json_mode:
+                    print(json.dumps({"event": "reply", "line": send, "reply": None}))
+                else:
+                    print("< (no reply)")
+            else:
+                if json_mode:
+                    print(json.dumps({"event": "reply", "line": send, "reply": r}))
+                else:
+                    print("< %s" % r)
+        if json_mode:
+            print(json.dumps({"event": "summary", "commands": cmds, "errors": errors}))
+        else:
+            print("%d commands, %d errors" % (cmds, errors))
+        return 0 if errors == 0 else 1
     except Exception as e:
         print("ERROR: %s" % e)
         return 1

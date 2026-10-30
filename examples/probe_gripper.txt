@@ -1,0 +1,22 @@
+# Short, reversible probe on the gripper motor only (motor 1).
+# Goal: find out whether the servo holds a position (180 deg unit) or keeps
+# spinning (360 deg unit). Both outcomes end at the stop pulse, so nothing runs away.
+# Run: tools\armctl.ps1 script examples\probe_gripper.txt --port COM4
+
+V
+wait 300
+R
+wait 500
+A0
+wait 200
+
+# Move 10 degrees away from neutral, slowly.
+M1:100:1500
+wait 2200
+
+# Back to neutral.
+M1:90:1500
+wait 2200
+
+# Report state, but stay enabled and holding.
+Q
