@@ -522,6 +522,10 @@ class VisualPulseCalibrator:
         return results
 
     def save_profile(self) -> str:
+        if self.dry_run:
+            # Never persist synthetic numbers: a fake stop pulse in the profile
+            # would be trusted by the next real run and could drive a servo.
+            return ""
         os.makedirs(os.path.dirname(os.path.abspath(self.profile_path)) or ".", exist_ok=True)
         self._profile["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         if self.camera is not None:
