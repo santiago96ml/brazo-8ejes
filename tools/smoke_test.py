@@ -28,7 +28,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        ser = serial.Serial(args.port, args.baud, timeout=0.2)
+        ser = serial.Serial(args.port, args.baud, timeout=1.0)
     except serial.SerialException as exc:
         print("cannot open %s: %s" % (args.port, exc))
         return 2

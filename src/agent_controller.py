@@ -344,8 +344,8 @@ class AgentController:
 
     def verify_i2c_link(self) -> Dict[str, Any]:
         self.transport.send_line("I")
-        import queue as _q
-        deadline = time.time() + 2.0
+        deadline = time.time() + 2.5
+        last_obj = None
         while time.time() < deadline:
             try:
                 raw = self.transport.rx_queue.get(timeout=0.1)
@@ -355,23 +355,35 @@ class AgentController:
                 obj = json.loads(raw)
             except Exception:
                 obj = {"raw": raw}
-            if (isinstance(obj, dict) and obj.get("status") == "OK"
-                    and obj.get("pca9685") == "CONECTADO_0x40"):
-                return {"ok": True, "response": obj}
-        return {"ok": False, "error": "no valid I response"}
+            last_obj = obj
+            if isinstance(obj, dict):
+                if obj.get("status") == "OK" and obj.get("pca9685") == "CONECTADO_0x40":
+                    return {"ok": True, "response": obj}
+                if obj.get("status") == "ERROR":
+                    return {"ok": False, "response": obj}
+        return {"ok": False, "error": "no valid I response", "last": last_obj}
 
     def demo_wave_and_twist(self) -> Dict[str, Any]:
         steps: List[str] = []
-        # lift to home
+        step_pause = 0.0 if self.sim else 0.75
+        lift_pause = 0.0 if self.sim else 1.5
+        # lift arm gently (slight forward reach + lift, then vertical HOME)
         try:
-            r = self.move_to_xyz(0.0, 0.0, 570.0, pitch_deg=90.0, speed_mm_s=80.0)
+            self.move_to_xyz(120.0, 0.0, 480.0, pitch_deg=60.0, speed_mm_s=90.0)
+            if lift_pause:
+                time.sleep(lift_pause)
+            self.move_to_xyz(0.0, 0.0, 570.0, pitch_deg=90.0, speed_mm_s=90.0)
+            if lift_pause:
+                time.sleep(lift_pause)
             steps.append("home")
         except Exception as e:
             steps.append("home-failed: %s" % e)
-        # wave gripper
+        # wave gripper (open / close / neutral salute)
         for op in (100.0, 0.0, 50.0, 100.0, 50.0):
             try:
                 self.set_gripper(op)
+                if step_pause:
+                    time.sleep(step_pause)
                 steps.append("gripper %s" % op)
             except Exception as e:
                 steps.append("gripper-failed: %s" % e)
@@ -379,12 +391,16 @@ class AgentController:
         for ang in (90.0, 180.0, 270.0, 0.0):
             try:
                 self.rotate_wrist(ang)
+                if step_pause:
+                    time.sleep(step_pause)
                 steps.append("wrist %s" % ang)
             except Exception as e:
                 steps.append("wrist-failed: %s" % e)
         # return home
         try:
-            self.move_to_xyz(0.0, 0.0, 570.0, pitch_deg=90.0, speed_mm_s=80.0)
+            self.move_to_xyz(0.0, 0.0, 570.0, pitch_deg=90.0, speed_mm_s=90.0)
+            if lift_pause:
+                time.sleep(lift_pause)
             steps.append("home")
         except Exception as e:
             steps.append("home-failed: %s" % e)
@@ -534,29 +550,34 @@ def main(argv=None) -> int:
             sim = True
     ctrl = AgentController(sim=sim)
     set_default_controller(ctrl)
+    try:
+        if args.check_port:
+            print("detected ports:")
+            try:
+                from serial.tools import list_ports
+                for p in list_ports.comports():
+                    print("  %s - %s" % (p.device, p.description))
+            except Exception as e:
+                print("  (serial unavailable: %s)" % e)
+            print("i2c:", json.dumps(ctrl.verify_i2c_link()))
+            return 0
 
-    if args.check_port:
-        print("detected ports:")
+        if args.pose:
+            print(json.dumps(ctrl.get_current_pose(), indent=2, default=_json_default))
+            return 0
+
+        if args.demo:
+            print(json.dumps(ctrl.demo_wave_and_twist(), indent=2, default=_json_default))
+            return 0
+
+        # default: print help-ish
+        print("agent_controller ready (sim=%s). Use --pose / --demo / --check-port." % sim)
+        return 0
+    finally:
         try:
-            from serial.tools import list_ports
-            for p in list_ports.comports():
-                print("  %s - %s" % (p.device, p.description))
-        except Exception as e:
-            print("  (serial unavailable: %s)" % e)
-        print("i2c:", json.dumps(ctrl.verify_i2c_link()))
-        return 0
-
-    if args.pose:
-        print(json.dumps(ctrl.get_current_pose(), indent=2, default=_json_default))
-        return 0
-
-    if args.demo:
-        print(json.dumps(ctrl.demo_wave_and_twist(), indent=2, default=_json_default))
-        return 0
-
-    # default: print help-ish
-    print("agent_controller ready (sim=%s). Use --pose / --demo / --check-port." % sim)
-    return 0
+            ctrl.transport.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

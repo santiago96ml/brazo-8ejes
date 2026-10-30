@@ -34,12 +34,16 @@ static uint16_t currentPulse[NUM_CH];
 static int8_t shoulderCoupling = 1;
 static bool estopLatched = false;
 static bool enabled = true;
+static unsigned long lastTickMs = 0;
+
+#define EEPROM_MAGIC_0 0xA6
+#define EEPROM_MAGIC_1 0x5A
 
 static char lineBuf0[256];
 static char lineBuf1[256];
 static uint16_t lineLen0 = 0;
 static uint16_t lineLen1 = 0;
-static char outBuf[512];
+static char outBuf[640];
 
 // ---------- helpers ----------
 static float clampf(float v, float lo, float hi) {
@@ -79,20 +83,15 @@ static void pcaWriteReg(uint8_t reg, uint8_t val) {
 static uint8_t pcaReadReg(uint8_t reg) {
   Wire.beginTransmission(PCA_ADDR);
   Wire.write(reg);
-  Wire.endTransmission(false);
+  Wire.endTransmission();
   Wire.requestFrom((uint8_t)PCA_ADDR, (uint8_t)1);
   if (Wire.available()) return Wire.read();
   return 0;
 }
 
-static bool pcaProbe() {
+static uint8_t pcaProbe() {
   Wire.beginTransmission(PCA_ADDR);
-  Wire.write(PCA_MODE1);
-  uint8_t err = Wire.endTransmission(false);
-  if (err != 0) return false;
-  Wire.requestFrom((uint8_t)PCA_ADDR, (uint8_t)1);
-  if (Wire.available()) { Wire.read(); return true; }
-  return false;
+  return Wire.endTransmission();
 }
 
 static void pcaSetPulse(uint8_t ch, uint16_t pulse) {
@@ -109,13 +108,15 @@ static void pcaSetPulse(uint8_t ch, uint16_t pulse) {
 }
 
 static void pcaInitDevice() {
+  pcaWriteReg(PCA_MODE1, 0x00);
+  delay(5);
   uint8_t old = pcaReadReg(PCA_MODE1);
   pcaWriteReg(PCA_MODE1, (old & 0x7F) | 0x10); // sleep
-  pcaWriteReg(PCA_PRESCALE, 121);
+  pcaWriteReg(PCA_PRESCALE, 121);              // 50 Hz
   pcaWriteReg(PCA_MODE1, old);
   delay(5);
-  pcaWriteReg(PCA_MODE1, 0xA0); // auto-increment + restart
-  for (uint8_t i = 0; i < 16; i++) pcaSetPulse(i, 307);
+  pcaWriteReg(PCA_MODE1, old | 0xA0);          // auto-increment + restart
+  for (uint8_t i = 0; i < NUM_CH; i++) pcaSetPulse(i, 307);
 }
 
 // ---------- defaults ----------
@@ -240,15 +241,17 @@ static void syncShoulderNow() {
 // ---------- tick ----------
 static void tick() {
   unsigned long now = millis();
-  // timed restore
+  // timed restore (checked every loop pass for millisecond accuracy)
   for (uint8_t i = 0; i < NUM_CH; i++) {
-    if (timedActive[i] && now >= timedEndMs[i]) {
+    if (timedActive[i] && (long)(now - timedEndMs[i]) >= 0) {
       timedActive[i] = false;
       currentPulse[i] = servoStopP[i];
       if (!estopLatched) pcaSetPulse(i, servoStopP[i]);
     }
   }
-  // positional advance
+  // 50 Hz (20 ms) non-blocking positional interpolation tick
+  if (now - lastTickMs < 20) return;
+  lastTickMs = now;
   for (uint8_t i = 0; i < NUM_CH; i++) {
     if (moving[i]) {
       unsigned long dur = moveDurationMs[i];
@@ -307,8 +310,40 @@ static void handleLine(char* line, uint8_t port) {
 
   // single char no-arg
   if (cmd == 'I') {
-    if (pcaProbe()) reply(port, "{\"status\":\"OK\",\"pca9685\":\"CONECTADO_0x40\"}");
-    else reply(port, "{\"status\":\"ERROR\",\"i2c_code\":4,\"msg\":\"Verificar SDA->Pin20 y SCL->Pin21\"}");
+    uint8_t err = pcaProbe();
+    if (err == 0) {
+      pcaInitDevice();
+      reply(port, "{\"status\":\"OK\",\"pca9685\":\"CONECTADO_0x40\"}");
+    } else {
+      HardwareSerial& out = (port == 0) ? Serial : Serial1;
+      out.print("{\"status\":\"ERROR\",\"i2c_code\":");
+      out.print(err);
+      out.print(",\"found\":[");
+      bool first = true;
+      for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+          if (!first) out.print(",");
+          out.print(addr);
+          first = false;
+        }
+      }
+      out.println("],\"msg\":\"Verificar SDA->Pin20, SCL->Pin21, VCC->5V y GND\"}");
+    }
+    return;
+  }
+  if (cmd == 'V') {
+    reply(port, "{\"status\":\"VERSION\",\"fw\":\"2.0.0\",\"board\":\"MEGA2560_PCA9685\",\"proto\":2}");
+    return;
+  }
+  if (cmd == 'F') {
+    for (uint8_t i = 0; i < NUM_CH; i++) {
+      moving[i] = false;
+      timedActive[i] = false;
+      currentPulse[i] = servoStopP[i];
+      if (!estopLatched) pcaSetPulse(i, servoStopP[i]);
+    }
+    broadcast("{\"event\":\"ALL_NEUTRAL\"}");
     return;
   }
   if (cmd == 'S') {
@@ -344,17 +379,22 @@ static void handleLine(char* line, uint8_t port) {
     return;
   }
   if (cmd == 'Q') {
+    HardwareSerial& out = (port == 0) ? Serial : Serial1;
     snprintf(outBuf, sizeof(outBuf), "{\"status\":\"STATE\",\"t\":%lu,\"oe\":%d,\"shoulder_coupling\":%d,\"motors\":[",
              millis(), digitalRead(PIN_OE), shoulderCoupling);
-    char item[96];
+    out.print(outBuf);
+    char item[112];
+    char sDeg[12], sTgt[12], sDps[12];
     for (uint8_t i = 0; i < NUM_CH; i++) {
-      snprintf(item, sizeof(item), "{\"m\":%u,\"ch\":%u,\"deg\":%.1f,\"target\":%.1f,\"pulse\":%u,\"stop\":%u,\"dps\":%.1f,\"moving\":%d}",
-               i + 1, i, (double)currentDeg[i], (double)targetDeg[i], currentPulse[i], servoStopP[i], (double)degPerSec[i], moving[i] ? 1 : 0);
-      strncat(outBuf, item, sizeof(outBuf) - strlen(outBuf) - 1);
-      if (i < NUM_CH - 1) strncat(outBuf, ",", sizeof(outBuf) - strlen(outBuf) - 1);
+      dtostrf(currentDeg[i], 1, 1, sDeg);
+      dtostrf(targetDeg[i], 1, 1, sTgt);
+      dtostrf(degPerSec[i], 1, 1, sDps);
+      snprintf(item, sizeof(item), "{\"m\":%u,\"ch\":%u,\"deg\":%s,\"target\":%s,\"pulse\":%u,\"stop\":%u,\"dps\":%s,\"moving\":%d}",
+               i + 1, i, sDeg, sTgt, currentPulse[i], servoStopP[i], sDps, moving[i] ? 1 : 0);
+      out.print(item);
+      if (i < NUM_CH - 1) out.print(",");
     }
-    strncat(outBuf, "]}", sizeof(outBuf) - strlen(outBuf) - 1);
-    reply(port, outBuf);
+    out.println("]}");
     return;
   }
   // U and J6
@@ -363,7 +403,9 @@ static void handleLine(char* line, uint8_t port) {
     int v = atoi(line + 1);
     if (v != 1 && v != -1) { snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"ERR\",\"code\":\"BAD_ARG\"}"); reply(port, outBuf); return; }
     shoulderCoupling = (int8_t)v;
-    EEPROM.write(0, (uint8_t)shoulderCoupling);
+    EEPROM.write(0, EEPROM_MAGIC_0);
+    EEPROM.write(1, EEPROM_MAGIC_1);
+    EEPROM.write(2, (uint8_t)shoulderCoupling);
     syncShoulderNow();
     snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"COUPLING\",\"shoulder_coupling\":%d}", shoulderCoupling);
     reply(port, outBuf);
@@ -373,7 +415,9 @@ static void handleLine(char* line, uint8_t port) {
     // J6 toggle
     if (line[1] == '6' || line[1] == '\0') {
       shoulderCoupling = (shoulderCoupling == 1) ? -1 : 1;
-      EEPROM.write(0, (uint8_t)shoulderCoupling);
+      EEPROM.write(0, EEPROM_MAGIC_0);
+      EEPROM.write(1, EEPROM_MAGIC_1);
+      EEPROM.write(2, (uint8_t)shoulderCoupling);
       syncShoulderNow();
       snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"COUPLING\",\"shoulder_coupling\":%d}", shoulderCoupling);
       reply(port, outBuf);
@@ -386,10 +430,8 @@ static void handleLine(char* line, uint8_t port) {
     if (estopLatched) { snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"ERR\",\"code\":\"ESTOP_LATCHED\"}"); reply(port, outBuf); return; }
     // parse G:m1,m2,m3,m4,m5,m7,ms  (line starts G: or G)
     char* p = line;
-    // skip 'G'
     p++;
     if (*p == ':') p++;
-    // now parse 7 comma-separated values: m1..m5, m7, ms  (m6 computed)
     float vals[7];
     uint8_t vi = 0;
     char* tok = strtok(p, ",");
@@ -398,22 +440,20 @@ static void handleLine(char* line, uint8_t port) {
       tok = strtok(NULL, ",");
     }
     if (vi < 7) { snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"ERR\",\"code\":\"BAD_ARG\"}"); reply(port, outBuf); return; }
-    float m1 = vals[0], m2 = vals[1], m3 = vals[2], m4 = vals[3], m5 = vals[4], m7 = vals[6];
-    unsigned long ms = (unsigned long)vals[5];
-    // vals[5] is m7? Wait order: m1,m2,m3,m4,m5,m7,ms => 7 values: indices 0..6 = m1,m2,m3,m4,m5,m7,ms
-    // Fix: above I read m7=vals[6] (wrong). Redo:
-    m7 = vals[5];
-    ms = (unsigned long)vals[6];
+    float m1 = vals[0], m2 = vals[1], m3 = vals[2], m4 = vals[3], m5 = vals[4], m7 = vals[5];
+    unsigned long ms = (unsigned long)vals[6];
     float m6 = coupledDeg(m5);
     if (ms == 0) ms = 1000;
-    // move channels
     startMove(0, m1, ms);
     startMove(1, m2, ms);
     startMove(2, m3, ms);
     startMove(3, m4, ms);
     startShoulderMove(m5, ms);
     startMove(6, m7, ms);
-    snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"G_OK\",\"m5\":%.1f,\"m6\":%.1f,\"ms\":%lu}", (double)m5, (double)m6, ms);
+    char sM5[12], sM6[12];
+    dtostrf(m5, 1, 1, sM5);
+    dtostrf(m6, 1, 1, sM6);
+    snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"G_OK\",\"m5\":%s,\"m6\":%s,\"ms\":%lu}", sM5, sM6, ms);
     reply(port, outBuf);
     return;
   }
@@ -490,7 +530,9 @@ static void handleLine(char* line, uint8_t port) {
     // if shoulder, sync partner? just set this channel
     currentPulse[ch] = stop;
     if (!estopLatched) pcaSetPulse(ch, stop);
-    snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"CALIBRATED\",\"motor\":%u,\"stop\":%u,\"dps\":%.1f}", motor, stop, (double)degPerSec[ch]);
+    char sDps[12];
+    dtostrf(degPerSec[ch], 1, 1, sDps);
+    snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"CALIBRATED\",\"motor\":%u,\"stop\":%u,\"dps\":%s}", motor, stop, sDps);
     reply(port, outBuf);
     return;
   }
@@ -577,8 +619,10 @@ void setup() {
   Wire.begin();
   defaultsInit();
   {
-    int8_t sc = (int8_t)EEPROM.read(0);
-    if (sc == 1 || sc == -1) shoulderCoupling = sc;
+    if (EEPROM.read(0) == EEPROM_MAGIC_0 && EEPROM.read(1) == EEPROM_MAGIC_1) {
+      int8_t sc = (int8_t)EEPROM.read(2);
+      if (sc == 1 || sc == -1) shoulderCoupling = sc;
+    }
   }
   pcaInitDevice();
 
