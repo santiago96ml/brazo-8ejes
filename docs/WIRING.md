@@ -140,3 +140,34 @@ Ranked causes seen in this build:
 - 20 A fuse on the rail, 16 AWG main run, distribution block, 1000-2200 uF bulk
   capacitor at the rail.
 - Never raise the current limit to force movement. Fix the cause.
+
+### Servo plug orientation (channel 5 melting case)
+
+A servo signal pin is high impedance: it cannot carry amps. If the **signal** wire of a
+servo connector heats up, current is flowing where it should not. The two realistic
+causes are:
+
+1. **Reversed or shifted plug.** Rotating a 3-pin shell 180 degrees swaps the two outer
+   pins (signal <-> GND) while V+ stays in the middle. The servo then returns through
+   the PWM pin, which on most PCA9685 boards sits behind a 220 ohm series resistor;
+   the resistor and the wire cook while the motor never turns properly. A plug shifted
+   by one pin does the same across two adjacent channels.
+2. **Damaged servo or lead.** A crushed cable or an internally shorted MG946R draws
+   current between GND and signal, heating exactly those two wires and leaving V+
+   comparatively cool.
+
+Isolation procedure, one servo at a time, supply OFF between steps:
+
+1. Compare wire colours and shell orientation of the suspect servo against a working
+   one. Standard MG946R: brown = GND, red = V+, orange = signal. Clone batches
+   sometimes ship black/red/white with a different physical order.
+2. With the servo disconnected, measure the PCA9685 channel: `PWM-GND`, `PWM-V+`,
+   `V+-GND` in resistance mode and compare with a known-good channel. A short means
+   the board trace or the 220 ohm resistor is damaged; that channel is dead.
+3. Test the suspect servo alone on a current-limited supply (1 A) with only GND and
+   V+ connected, no signal. A healthy servo stays still and draws almost nothing.
+   If it draws current or twitches by itself, the servo is internally shorted.
+4. Never reuse a heat-damaged lead: the insulation is compromised and the copper is
+   annealed. Replace the pigtail.
+5. Only after the channel and the servo pass, reconnect one servo at a time and watch
+   the current on the supply.
