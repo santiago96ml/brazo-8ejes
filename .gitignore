@@ -14,3 +14,7 @@ host/*.egg-info/
 .atl/
 Thumbs.db
 desktop.ini
+
+tools/camera_previews/
+tools/aruco_sheet.png
+dataset/
