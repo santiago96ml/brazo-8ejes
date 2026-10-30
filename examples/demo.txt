@@ -1,0 +1,42 @@
+# Safe demo sequence for the 8-axis arm.
+# Run with: tools\armctl.ps1 script examples\demo.txt
+# Keep the arm unloaded and the shoulder couplers loose on the first run.
+
+V
+wait 200
+I
+wait 300
+R
+wait 300
+A500
+wait 500
+
+# Base sweep
+M7:80
+wait 1200
+M7:110
+wait 1200
+
+# Elbow + shoulder together, both finish at the same time
+X4:75,5:105,6:75
+wait 1800
+
+# Gripper pulse and wrist
+M1:45
+wait 700
+M1:120
+wait 700
+M2:60
+wait 700
+M2:120
+wait 700
+
+# Continuous example, only if motor 8 is a continuous unit:
+# T8:35:400
+# wait 600
+
+# Park
+H
+wait 2000
+A0
+F
