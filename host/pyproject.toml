@@ -1,0 +1,13 @@
+[project]
+name = "armctl"
+version = "1.0.0"
+description = "Host controller for 8-axis robotic arm"
+requires-python = ">=3.9"
+dependencies = ["pyserial>=3.5"]
+
+[project.scripts]
+armctl = "armctl.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

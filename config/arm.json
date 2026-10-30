@@ -1,0 +1,16 @@
+{
+  "port": "COM4",
+  "baud": 115200,
+  "watchdog_ms": 3000,
+  "speed_dps": 60,
+  "joints": [
+    {"name": "gripper", "motor": 1, "label": "PINZA", "mode": "P", "pulse_min": 110, "pulse_stop": 307, "pulse_max": 500, "limits_deg": [0, 90]},
+    {"name": "wrist_roll", "motor": 2, "label": "GIRO_PINZA", "mode": "P", "pulse_min": 110, "pulse_stop": 307, "pulse_max": 500, "limits_deg": [0, 180]},
+    {"name": "wrist_pitch", "motor": 3, "label": "INCLINA_PINZA", "mode": "P", "pulse_min": 110, "pulse_stop": 307, "pulse_max": 500, "limits_deg": [0, 180]},
+    {"name": "elbow", "motor": 4, "label": "CODO", "mode": "P", "pulse_min": 110, "pulse_stop": 307, "pulse_max": 500, "limits_deg": [0, 180]},
+    {"name": "shoulder_left", "motor": 5, "label": "HOMBRO_IZQ", "mode": "P", "pulse_min": 110, "pulse_stop": 307, "pulse_max": 500, "limits_deg": [0, 180]},
+    {"name": "shoulder_right", "motor": 6, "label": "HOMBRO_DER", "mode": "P", "pulse_min": 110, "pulse_stop": 307, "pulse_max": 500, "limits_deg": [0, 180], "mirror": {"source": 5, "invert": true}},
+    {"name": "base", "motor": 7, "label": "BASE", "mode": "P", "pulse_min": 110, "pulse_stop": 307, "pulse_max": 500, "limits_deg": [0, 180]},
+    {"name": "aux", "motor": 8, "label": "AUX", "mode": "P", "pulse_min": 110, "pulse_stop": 307, "pulse_max": 500, "limits_deg": [0, 180]}
+  ]
+}

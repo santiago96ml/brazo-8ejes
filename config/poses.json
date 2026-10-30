@@ -1,0 +1,32 @@
+{
+  "home": {
+    "gripper": 45,
+    "wrist_roll": 90,
+    "wrist_pitch": 90,
+    "elbow": 90,
+    "shoulder_left": 90,
+    "shoulder_right": 90,
+    "base": 90,
+    "aux": 90
+  },
+  "rest": {
+    "gripper": 0,
+    "wrist_roll": 90,
+    "wrist_pitch": 90,
+    "elbow": 120,
+    "shoulder_left": 30,
+    "shoulder_right": 150,
+    "base": 0,
+    "aux": 90
+  },
+  "ready": {
+    "gripper": 30,
+    "wrist_roll": 90,
+    "wrist_pitch": 45,
+    "elbow": 90,
+    "shoulder_left": 45,
+    "shoulder_right": 135,
+    "base": 90,
+    "aux": 90
+  }
+}
