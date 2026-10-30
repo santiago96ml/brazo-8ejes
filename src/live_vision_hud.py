@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -242,6 +243,65 @@ def _draw_skeleton(img, analysis):
                     pass
 
 
+def _load_joint_modes(config_path: str | None = None) -> dict:
+    """motor -> 'P' | 'C' from config/arm.json (defaults to positional)."""
+    path = config_path or os.path.join(REPO_ROOT, "config", "arm.json")
+    modes = {m: "P" for m in range(1, 9)}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        for joint in data.get("joints", []):
+            motor = int(joint.get("motor", 0))
+            mode = str(joint.get("mode", "P")).upper()[:1]
+            if 1 <= motor <= 8 and mode in ("P", "C"):
+                modes[motor] = mode
+    except Exception:
+        pass
+    return modes
+
+
+def jog_command(motor: int, direction: int, mode: str, current_deg: float,
+                step_deg: float = 3.0, offset: int = 40, burst_ms: int = 150) -> str:
+    """Build the safest wire line for a keyboard jog.
+
+    Positional joints step by ``step_deg`` (clamped 0..180 by the firmware).
+    Continuous joints cannot hold an angle, so they get a short timed burst.
+    """
+    motor = int(motor)
+    if not 1 <= motor <= 8:
+        raise ValueError("motor must be 1..8")
+    if direction == 0:
+        raise ValueError("direction must be +1 or -1")
+    if str(mode).upper().startswith("C"):
+        offset = max(-150, min(150, int(offset)))
+        return "T%d:%d:%d" % (motor, offset if direction > 0 else -offset, int(burst_ms))
+    target = float(current_deg) + direction * float(step_deg)
+    target = max(0.0, min(180.0, target))
+    return "M%d:%s:400" % (motor, ("%g" % round(target, 1)))
+
+
+def _jog_send(jog: dict, direction: int, controller, analysis) -> str | None:
+    if controller is None:
+        return None
+    motor = int(jog["motor"])
+    current = 90.0
+    motors = (analysis or {}).get("motors_deg") or {}
+    try:
+        if isinstance(motors, dict) and motor in motors:
+            current = float(motors[motor])
+    except Exception:
+        pass
+    line = jog_command(motor, direction, jog["modes"].get(motor, "P"), current,
+                       step_deg=jog["step"], offset=jog["offset"], burst_ms=jog["burst_ms"])
+    try:
+        if hasattr(controller, "transport"):
+            controller.transport.send_line(line)
+    except Exception:
+        return None
+    jog["last_line"] = line
+    return line
+
+
 def run_hud(
     camera_index: int = 0,
     width: int = 1280,
@@ -288,6 +348,14 @@ def run_hud(
     last_analysis = None
     stopped_by = None
     _none_streak = 0
+    jog = {
+        "motor": 2,
+        "step": 3.0,
+        "offset": 40,
+        "burst_ms": 150,
+        "modes": _load_joint_modes(),
+        "last_line": None,
+    }
 
     try:
         if show and cv2 is not None:
@@ -372,8 +440,19 @@ def run_hud(
                 y += 20
 
                 oe_txt, oe_color = _oe_text(controller)
+                if bool(getattr(controller, "sim", False)):
+                    oe_txt = "SIM (no hardware)  " + oe_txt
+                    oe_color = (0, 200, 255)
                 _draw_text(disp, oe_txt, (10, y), color=oe_color)
                 y += 20
+                _draw_text(
+                    disp,
+                    "JOG m=%d mode=%s  [1-8] [w/s or arrows] +/-  last=%s"
+                    % (jog["motor"], jog["modes"].get(jog["motor"], "P"), jog["last_line"] or "-"),
+                    (10, y),
+                    scale=0.5,
+                )
+                y += 18
 
                 # top-left FPS & latency & mode & confidence
                 try:
@@ -408,7 +487,13 @@ def run_hud(
                 if key == 27 or key in (ord("q"), ord("Q")):
                     stopped_by = "q"
                     break
-                if key == 32:  # SPACE
+                if ord("1") <= key <= ord("8"):
+                    jog["motor"] = key - ord("0")
+                elif key in (ord("+"), ord("="), ord("w"), ord("W"), 82):
+                    _jog_send(jog, +1, controller, analysis)
+                elif key in (ord("-"), ord("_"), ord("s"), ord("S"), 84):
+                    _jog_send(jog, -1, controller, analysis)
+                elif key == 32:  # SPACE
                     try:
                         if controller is not None:
                             controller.emergency_stop()
@@ -504,6 +589,11 @@ def main(argv=None) -> int:
         configure_opencv()
     except Exception:
         pass
+
+    if sim:
+        print("[hud] controls are SIMULATED (no serial). Pass --port COM4 to drive the arm.")
+    else:
+        print("[hud] controls go to the real board on %s." % (args.port or "auto-detected port"))
 
     res = run_hud(
         camera_index=args.camera,

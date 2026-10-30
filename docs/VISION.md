@@ -193,3 +193,26 @@ python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch t
 
 python -c "from tools.train_arm_keypoints import check_environment; print(check_environment())"
 reports readiness and prints the same hint.
+
+## Keyboard jog (teleoperation)
+
+The HUD now doubles as a teleoperation panel:
+
+| Key | Action |
+|---|---|
+| `1`..`8` | select the active motor |
+| `w` / up arrow / `+` | jog +one step |
+| `s` / down arrow / `-` | jog -one step |
+| `SPACE` | emergency stop (`S`) |
+| `Z` | zero / real-state sync |
+| `G` | save dataset sample |
+| `Q` / `ESC` | quit |
+
+Positional joints send `M<motor>:<deg>:400` (3 deg step, clamped 0..180 by the
+firmware). Continuous joints cannot hold an angle, so they send a timed burst
+`T<motor>:<offset>:150` (offset +/-40). The mode comes from `config/arm.json`
+(`mode` field, default `P`).
+
+The HUD prints `controls are SIMULATED` at startup unless `--port COM4` is
+passed; the overlay also prefixes `SIM (no hardware)` so nobody mistakes a
+simulated E-STOP for a real one.
