@@ -58,6 +58,16 @@ S8 — Hardware Integrator, CLI & AI Agent API (`src/agent_controller.py`):
   - `set_gripper(open_percent)`
   - `pick_and_place(origin_xyz, target_xyz, approach_height_mm)`
   - `emergency_stop()`
+  - `zero_jump_boot_sync()`
+
+S9 — Vision Node (Netbook Conectar Igualdad / Ubuntu Server) & Read-First / Zero-Jump Boot (`src/vision_locator.py` & `src/state_manager.py` & `firmware_mega/firmware_mega.ino`):
+- In `setup()`, `firmware_mega.ino` MUST keep `digitalWrite(PIN_OE, HIGH)` so the arm boots with PWM outputs physically disabled.
+- Supports silent PWM preload (`Z:<m1>,<m2>,<m3>,<m4>,<m5>,<m7>` and `P`/`M` while `OE=HIGH`) and EEPROM odometry persistence (`E` / auto-save).
+- `src/vision_locator.py` implements:
+  1. Reading the current physical posture from the Ubuntu Server netbook camera (ArUco markers or HSV blue-arm silhouette, HTTP JSON endpoint `/pose`, plus a built-in `--serve` HTTP vision server script for the Ubuntu Server netbook).
+  2. Feeding those real angles into $T_0^6$ (`forward_kinematics`) to compute the exact resting $(X, Y, Z)$.
+  3. Silently preloading the PWM registers on the PCA9685 while `PIN_OE` remains `HIGH`.
+  4. Lowering `PIN_OE` to `LOW` (`R`) ONLY after verifying software-hardware angle match, achieving a 100% jerk-free startup.
 
 ## Tasks
 
@@ -69,6 +79,7 @@ S8 — Hardware Integrator, CLI & AI Agent API (`src/agent_controller.py`):
 | T4 | S7 | delegated (Sub-Agent 4: `tests/test_kinematics_and_protocol.py`) | done | `ad3436b` |
 | T5 | S8 | delegated (Sub-Agent 5: `src/agent_controller.py`) | done | `8f88005` |
 | T6 | S1-S8 | inline + independent verifier (`opencode-go/iceman-contributor-free`, all S1-S8 PASS) | done | `ad3436b` |
+| T7 | S9 + S1-S8 | delegated (5 Sub-Agents on `opencode-go/*`: Zero-Jump Boot `OE=HIGH`, `src/vision_locator.py`, pitch interpolation in `move_linear_xyz`, QA `test_06`, live `COM4` upload & demo) | done | `HEAD` |
 
 ## Log
 
@@ -91,3 +102,5 @@ L6 — 2026-10-30: User supplied the Master Multi-Agent Orchestration Prompt for
   5. `src/agent_controller.py` (COM auto-detection, `arduino-cli` compile/flash, `get_current_pose`, `move_to_xyz`, `rotate_wrist`, `set_gripper`, `pick_and_place`, `emergency_stop`).
 
 L7 — 2026-10-30: User clarified: "es solamantes el planteamiento no esta conectado el mega". Do not flash or block on physical serial hardware; verify firmware compilation via `arduino-cli compile` and run `agent_controller.py` / QA tests in simulation / offline verification mode.
+
+L8 — 2026-10-30: User ran `python -m src.agent_controller --demo` (which revealed `move_linear_xyz` failed on waypoint 0 when starting from singular vertical `HOME` `(0,0,570)` with target `pitch_deg=60.0` instead of interpolating `pitch_deg` from start to target) and supplied the updated Master Prompt adding the Vision Node on the Netbook Conectar Igualdad (Ubuntu Server) + Read-First / Zero-Jump Boot (`src/vision_locator.py`, `setup()` keeping `PIN_OE = HIGH`, silent PWM preload before `R`, EEPROM odometry persistence).

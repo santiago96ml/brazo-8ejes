@@ -33,11 +33,70 @@ static uint16_t currentPulse[NUM_CH];
 
 static int8_t shoulderCoupling = 1;
 static bool estopLatched = false;
-static bool enabled = true;
+static bool enabled = false;
 static unsigned long lastTickMs = 0;
 
 #define EEPROM_MAGIC_0 0xA6
-#define EEPROM_MAGIC_1 0x5A
+#define EEPROM_MAGIC_1 0x5C
+
+struct EepromState {
+  uint8_t magic0;
+  uint8_t magic1;
+  int8_t shoulderCoupling;
+  uint16_t servoStopP[8];
+  float currentDeg[8];
+  float degPerSec[8];
+};
+
+static void saveStateToEeprom() {
+  int addr = 0;
+  EEPROM.write(addr++, EEPROM_MAGIC_0);
+  EEPROM.write(addr++, EEPROM_MAGIC_1);
+  EEPROM.write(addr++, (uint8_t)shoulderCoupling);
+  for (uint8_t i = 0; i < NUM_CH; i++) {
+    EEPROM.write(addr++, (uint8_t)(servoStopP[i] & 0xFF));
+    EEPROM.write(addr++, (uint8_t)((servoStopP[i] >> 8) & 0xFF));
+  }
+  // write floats
+  for (uint8_t i = 0; i < NUM_CH; i++) {
+    float f = currentDeg[i];
+    uint8_t* p = (uint8_t*)&f;
+    for (uint8_t b = 0; b < 4; b++) EEPROM.write(addr++, p[b]);
+  }
+  for (uint8_t i = 0; i < NUM_CH; i++) {
+    float f = degPerSec[i];
+    uint8_t* p = (uint8_t*)&f;
+    for (uint8_t b = 0; b < 4; b++) EEPROM.write(addr++, p[b]);
+  }
+}
+
+static bool loadStateFromEeprom() {
+  if (EEPROM.read(0) != EEPROM_MAGIC_0 || EEPROM.read(1) != EEPROM_MAGIC_1) return false;
+  int addr = 2;
+  int8_t sc = (int8_t)EEPROM.read(addr++);
+  if (sc == 1 || sc == -1) shoulderCoupling = sc;
+  for (uint8_t i = 0; i < NUM_CH; i++) {
+    uint8_t lo = EEPROM.read(addr++);
+    uint8_t hi = EEPROM.read(addr++);
+    servoStopP[i] = (uint16_t)lo | ((uint16_t)hi << 8);
+  }
+  for (uint8_t i = 0; i < NUM_CH; i++) {
+    float f = 0;
+    uint8_t* p = (uint8_t*)&f;
+    for (uint8_t b = 0; b < 4; b++) p[b] = EEPROM.read(addr++);
+    currentDeg[i] = f;
+    startDeg[i] = f;
+    targetDeg[i] = f;
+    currentPulse[i] = degToPulse(i, f);
+  }
+  for (uint8_t i = 0; i < NUM_CH; i++) {
+    float f = 60.0f;
+    uint8_t* p = (uint8_t*)&f;
+    for (uint8_t b = 0; b < 4; b++) p[b] = EEPROM.read(addr++);
+    if (f > 0) degPerSec[i] = f;
+  }
+  return true;
+}
 
 static char lineBuf0[256];
 static char lineBuf1[256];
@@ -53,24 +112,38 @@ static float clampf(float v, float lo, float hi) {
 }
 
 static uint16_t degToPulse(uint8_t ch, float deg) {
-  float mn = minDeg[ch], mx = maxDeg[ch];
-  if (mx <= mn) mx = mn + 1.0f;
-  float t = (deg - mn) / (mx - mn);
-  t = clampf(t, 0.0f, 1.0f);
-  float p = servoMinP[ch] + t * (servoMaxP[ch] - servoMinP[ch]);
+  float mn = minDeg[ch], mx = maxDeg[ch], hm = homeDeg[ch];
+  deg = clampf(deg, mn, mx);
+  float st = (float)servoStopP[ch];
+  float p = st;
+  if (fabsf(deg - hm) < 0.05f) {
+    p = st;
+  } else if (deg > hm && mx > hm) {
+    float t = clampf((deg - hm) / (mx - hm), 0.0f, 1.0f);
+    p = st + t * ((float)servoMaxP[ch] - st);
+  } else if (deg < hm && hm > mn) {
+    float t = clampf((hm - deg) / (hm - mn), 0.0f, 1.0f);
+    p = st - t * (st - (float)servoMinP[ch]);
+  }
   if (p < 0) p = 0;
   if (p > 4095) p = 4095;
-  return (uint16_t)p;
+  return (uint16_t)(p + 0.5f);
 }
 
 static float pulseToDeg(uint8_t ch, uint16_t pulse) {
-  float mn = minDeg[ch], mx = maxDeg[ch];
-  if (mx <= mn) mx = mn + 1.0f;
-  float span = (float)(servoMaxP[ch] - servoMinP[ch]);
-  if (span < 1) span = 1;
-  float t = ((float)pulse - servoMinP[ch]) / span;
-  t = clampf(t, 0.0f, 1.0f);
-  return mn + t * (mx - mn);
+  float mn = minDeg[ch], mx = maxDeg[ch], hm = homeDeg[ch];
+  float st = (float)servoStopP[ch];
+  float pf = (float)pulse;
+  if (fabsf(pf - st) < 0.5f) return hm;
+  if (pf > st && servoMaxP[ch] > servoStopP[ch]) {
+    float t = clampf((pf - st) / ((float)servoMaxP[ch] - st), 0.0f, 1.0f);
+    return hm + t * (mx - hm);
+  }
+  if (pf < st && servoStopP[ch] > servoMinP[ch]) {
+    float t = clampf((st - pf) / (st - (float)servoMinP[ch]), 0.0f, 1.0f);
+    return hm - t * (hm - mn);
+  }
+  return hm;
 }
 
 static void pcaWriteReg(uint8_t reg, uint8_t val) {
@@ -140,15 +213,15 @@ static void defaultsInit() {
     timedRestoreP[i] = 307;
     currentPulse[i] = 307;
   }
-  // per-channel degree ranges
-  minDeg[0] = 0;   maxDeg[0] = 100;  homeDeg[0] = 50;   // PINZA
-  minDeg[1] = 0;   maxDeg[1] = 360;  homeDeg[1] = 0;     // GIRO_PINZA
-  minDeg[2] = 0;   maxDeg[2] = 180;  homeDeg[2] = 90;    // INCLINA
-  minDeg[3] = 0;   maxDeg[3] = 180;  homeDeg[3] = 90;    // CODO
-  minDeg[4] = 15;  maxDeg[4] = 165;  homeDeg[4] = 90;    // HOMBRO_IZQ
-  minDeg[5] = 15;  maxDeg[5] = 165;  homeDeg[5] = 90;    // HOMBRO_DER
-  minDeg[6] = 0;   maxDeg[6] = 360;  homeDeg[6] = 0;     // BASE
-  minDeg[7] = 0;   maxDeg[7] = 180;  homeDeg[7] = 90;    // AUX
+  // per-channel degree ranges (homeDeg anchored to servoStopP = 307)
+  minDeg[0] = 0;     maxDeg[0] = 100;  homeDeg[0] = 50;   // PINZA
+  minDeg[1] = -360;  maxDeg[1] = 360;  homeDeg[1] = 0;    // GIRO_PINZA
+  minDeg[2] = 0;     maxDeg[2] = 180;  homeDeg[2] = 90;   // INCLINA
+  minDeg[3] = 0;     maxDeg[3] = 180;  homeDeg[3] = 90;   // CODO
+  minDeg[4] = 15;    maxDeg[4] = 165;  homeDeg[4] = 90;   // HOMBRO_IZQ
+  minDeg[5] = 15;    maxDeg[5] = 165;  homeDeg[5] = 90;   // HOMBRO_DER
+  minDeg[6] = -360;  maxDeg[6] = 360;  homeDeg[6] = 0;    // BASE
+  minDeg[7] = 0;     maxDeg[7] = 180;  homeDeg[7] = 90;   // AUX
   for (uint8_t i = 0; i < NUM_CH; i++) {
     currentDeg[i] = homeDeg[i];
     startDeg[i] = homeDeg[i];
@@ -357,6 +430,7 @@ static void handleLine(char* line, uint8_t port) {
       currentPulse[i] = servoStopP[i];
       pcaSetPulse(i, servoStopP[i]);
     }
+    saveStateToEeprom();
     broadcast("{\"event\":\"EMERGENCY_STOP\",\"oe\":\"HIGH\"}");
     return;
   }
@@ -403,9 +477,7 @@ static void handleLine(char* line, uint8_t port) {
     int v = atoi(line + 1);
     if (v != 1 && v != -1) { snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"ERR\",\"code\":\"BAD_ARG\"}"); reply(port, outBuf); return; }
     shoulderCoupling = (int8_t)v;
-    EEPROM.write(0, EEPROM_MAGIC_0);
-    EEPROM.write(1, EEPROM_MAGIC_1);
-    EEPROM.write(2, (uint8_t)shoulderCoupling);
+    saveStateToEeprom();
     syncShoulderNow();
     snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"COUPLING\",\"shoulder_coupling\":%d}", shoulderCoupling);
     reply(port, outBuf);
@@ -415,14 +487,62 @@ static void handleLine(char* line, uint8_t port) {
     // J6 toggle
     if (line[1] == '6' || line[1] == '\0') {
       shoulderCoupling = (shoulderCoupling == 1) ? -1 : 1;
-      EEPROM.write(0, EEPROM_MAGIC_0);
-      EEPROM.write(1, EEPROM_MAGIC_1);
-      EEPROM.write(2, (uint8_t)shoulderCoupling);
+      saveStateToEeprom();
       syncShoulderNow();
       snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"COUPLING\",\"shoulder_coupling\":%d}", shoulderCoupling);
       reply(port, outBuf);
       return;
     }
+  }
+  if (cmd == 'E') {
+    saveStateToEeprom();
+    reply(port, "{\"ack\":\"SAVED\"}");
+    return;
+  }
+  if (cmd == 'Z') {
+    // Z:<m1>,<m2>,<m3>,<m4>,<m5>,<m7>
+    char* p = line;
+    p++;
+    if (*p == ':') p++;
+    float vals[6];
+    uint8_t vi = 0;
+    char* tok = strtok(p, ",");
+    while (tok && vi < 6) {
+      vals[vi++] = atof(tok);
+      tok = strtok(NULL, ",");
+    }
+    if (vi < 6) { snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"ERR\",\"code\":\"BAD_ARG\"}"); reply(port, outBuf); return; }
+    float m1=vals[0], m2=vals[1], m3=vals[2], m4=vals[3], m5=vals[4], m7=vals[5];
+    float m6 = coupledDeg(m5);
+    // preload motors 1,2,3,4,5,6,7
+    // m1 -> ch0
+    auto preloadCh = [&](uint8_t ch, float deg) {
+      deg = clampf(deg, minDeg[ch], maxDeg[ch]);
+      currentDeg[ch] = deg;
+      targetDeg[ch] = deg;
+      startDeg[ch] = deg;
+      moving[ch] = false;
+      timedActive[ch] = false;
+      currentPulse[ch] = degToPulse(ch, deg);
+      pcaSetPulse(ch, currentPulse[ch]);
+    };
+    preloadCh(0,m1); preloadCh(1,m2); preloadCh(2,m3); preloadCh(3,m4);
+    // shoulder
+    {
+      float masterDeg = clampf(m5, minDeg[4], maxDeg[4]);
+      float slaveDeg  = coupledDeg(masterDeg);
+      currentDeg[4]=masterDeg; targetDeg[4]=masterDeg; startDeg[4]=masterDeg; moving[4]=false; timedActive[4]=false;
+      currentDeg[5]=slaveDeg;  targetDeg[5]=slaveDeg;  startDeg[5]=slaveDeg;  moving[5]=false; timedActive[5]=false;
+      currentPulse[4]=degToPulse(4,masterDeg); currentPulse[5]=degToPulse(5,slaveDeg);
+      pcaSetPulse(4,currentPulse[4]); pcaSetPulse(5,currentPulse[5]);
+    }
+    preloadCh(6,m7);
+    saveStateToEeprom();
+    char sM5[12], sM6[12];
+    dtostrf(m5,1,1,sM5); dtostrf(m6,1,1,sM6);
+    snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"PRELOADED\",\"oe\":%d,\"m5\":%s,\"m6\":%s}", digitalRead(PIN_OE), sM5, sM6);
+    reply(port, outBuf);
+    return;
   }
 
   // G command
@@ -550,13 +670,29 @@ static void handleLine(char* line, uint8_t port) {
     unsigned long ms = 0;
     if (colon) ms = strtoul(colon + 1, NULL, 10);
     if (motor == 5) {
-      startShoulderMove(deg, ms);
+      // allow writing registers even if OE HIGH for silent preload
+      float md = clampf(deg, minDeg[4], maxDeg[4]);
+      float sd = coupledDeg(md);
+      currentDeg[4]=md; targetDeg[4]=md; startDeg[4]=md; moving[4]=false; timedActive[4]=false;
+      currentDeg[5]=sd;  targetDeg[5]=sd;  startDeg[5]=sd;  moving[5]=false; timedActive[5]=false;
+      currentPulse[4]=degToPulse(4,md); currentPulse[5]=degToPulse(5,sd);
+      pcaSetPulse(4,currentPulse[4]); pcaSetPulse(5,currentPulse[5]);
+      if (ms > 0) startShoulderMove(md, ms);
     } else if (motor == 6) {
-      // convert slave deg to master deg
-      float masterDeg = (shoulderCoupling == 1) ? deg : (180.0f - deg);
-      startShoulderMove(masterDeg, ms);
+      float slaveDeg = clampf(deg, minDeg[5], maxDeg[5]);
+      float masterDeg = (shoulderCoupling == 1) ? slaveDeg : (180.0f - slaveDeg);
+      currentDeg[4]=masterDeg; targetDeg[4]=masterDeg; startDeg[4]=masterDeg; moving[4]=false; timedActive[4]=false;
+      currentDeg[5]=slaveDeg;  targetDeg[5]=slaveDeg;  startDeg[5]=slaveDeg;  moving[5]=false; timedActive[5]=false;
+      currentPulse[4]=degToPulse(4,masterDeg); currentPulse[5]=degToPulse(5,slaveDeg);
+      pcaSetPulse(4,currentPulse[4]); pcaSetPulse(5,currentPulse[5]);
+      if (ms > 0) startShoulderMove(masterDeg, ms);
     } else {
-      startMove(ch, deg, ms);
+      // allow preload while OE HIGH
+      deg = clampf(deg, minDeg[ch], maxDeg[ch]);
+      currentDeg[ch]=deg; targetDeg[ch]=deg; startDeg[ch]=deg; moving[ch]=false; timedActive[ch]=false;
+      currentPulse[ch]=degToPulse(ch,deg);
+      pcaSetPulse(ch,currentPulse[ch]);
+      if (ms > 0) startMove(ch, deg, ms);
     }
     snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"M_OK\",\"motor\":%u,\"deg\":%d}", motor, (int)deg);
     reply(port, outBuf);
@@ -572,34 +708,34 @@ static void handleLine(char* line, uint8_t port) {
     if (line[2] != ':') { snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"ERR\",\"code\":\"BAD_ARG\"}"); reply(port, outBuf); return; }
     uint16_t pulse = (uint16_t)strtoul(line + 3, NULL, 10);
     if (motor == 5 || motor == 6) {
-      // update both
+      // update both - allow preload while OE HIGH
       if (motor == 5) {
         currentDeg[4] = pulseToDeg(4, pulse);
         currentPulse[4] = pulse;
         moving[4] = false; timedActive[4] = false;
-        if (!estopLatched) pcaSetPulse(4, pulse);
+        pcaSetPulse(4, pulse);
         float sd = coupledDeg(currentDeg[4]);
         currentDeg[5] = sd;
         currentPulse[5] = degToPulse(5, sd);
         moving[5] = false; timedActive[5] = false;
-        if (!estopLatched) pcaSetPulse(5, currentPulse[5]);
+        pcaSetPulse(5, currentPulse[5]);
       } else {
         currentDeg[5] = pulseToDeg(5, pulse);
         currentPulse[5] = pulse;
         moving[5] = false; timedActive[5] = false;
-        if (!estopLatched) pcaSetPulse(5, pulse);
+        pcaSetPulse(5, pulse);
         float md = (shoulderCoupling == 1) ? currentDeg[5] : (180.0f - currentDeg[5]);
         currentDeg[4] = md;
         currentPulse[4] = degToPulse(4, md);
         moving[4] = false; timedActive[4] = false;
-        if (!estopLatched) pcaSetPulse(4, currentPulse[4]);
+        pcaSetPulse(4, currentPulse[4]);
       }
     } else {
       currentDeg[ch] = pulseToDeg(ch, pulse);
       currentPulse[ch] = pulse;
       moving[ch] = false;
       timedActive[ch] = false;
-      if (!estopLatched) pcaSetPulse(ch, pulse);
+      pcaSetPulse(ch, pulse);
     }
     snprintf(outBuf, sizeof(outBuf), "{\"ack\":\"P_OK\",\"motor\":%u,\"pulse\":%u}", motor, pulse);
     reply(port, outBuf);
@@ -626,18 +762,20 @@ void setup() {
   }
   pcaInitDevice();
 
-  // all channels to stop
+  loadStateFromEeprom();
+
+  // all channels to stop/preload values
   for (uint8_t i = 0; i < NUM_CH; i++) {
-    pcaSetPulse(i, servoStopP[i]);
-    currentPulse[i] = servoStopP[i];
+    currentPulse[i] = degToPulse(i, currentDeg[i]);
+    pcaSetPulse(i, currentPulse[i]);
   }
 
-  // enable outputs
+  // keep outputs disabled at boot
   estopLatched = false;
-  enabled = true;
-  digitalWrite(PIN_OE, LOW);
+  enabled = false;
+  digitalWrite(PIN_OE, HIGH);
 
-  snprintf(outBuf, sizeof(outBuf), "{\"status\":\"READY\",\"board\":\"MEGA2560_PCA9685\",\"fw\":\"2.0.0\",\"shoulder_coupling\":%d}", shoulderCoupling);
+  snprintf(outBuf, sizeof(outBuf), "{\"status\":\"READY\",\"board\":\"MEGA2560_PCA9685\",\"fw\":\"2.1.0\",\"oe\":\"HIGH\",\"shoulder_coupling\":%d}", shoulderCoupling);
   Serial.println(outBuf);
   Serial1.println(outBuf);
 }

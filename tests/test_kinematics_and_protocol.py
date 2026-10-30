@@ -222,6 +222,12 @@ class TestKinematicsAndProtocol(unittest.TestCase):
         ctrl.pick_and_place((0.0, 0.0, 500.0), (10.0, 0.0, 500.0), approach_height_mm=50.0, pitch_deg=90.0)
         self.assertTrue(len(spy.sent) > 0)
 
+        spy.sent.clear()
+        demo = ctrl.demo_wave_and_twist()
+        self.assertNotIn("demo", demo)
+        self.assertIn("steps", demo)
+        self.assertFalse(any("failed" in str(s).lower() for s in demo["steps"]))
+
         # protocol builders
         self.assertEqual(P.cmd_info(), "I")
         self.assertEqual(P.cmd_stop(), "S")
@@ -234,6 +240,52 @@ class TestKinematicsAndProtocol(unittest.TestCase):
         self.assertEqual(P.cmd_multi([(1, 10), (7, 20)]), "X1:10,7:20")
         coord = "G:1,2,3,4,5,7,1000"
         self.assertTrue(coord.startswith("G:"))
+
+    def test_06_vision_zero_jump_boot_sync(self):
+        try:
+            from src.vision_locator import VisionLocator, zero_jump_boot_sync
+        except Exception:
+            try:
+                from vision_locator import VisionLocator, zero_jump_boot_sync  # type: ignore
+            except Exception:
+                import vision_locator  # type: ignore
+                VisionLocator = vision_locator.VisionLocator
+                zero_jump_boot_sync = vision_locator.zero_jump_boot_sync
+
+        vl = VisionLocator()
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        frame[60:180, 140:180] = np.array([220, 40, 30], dtype=np.uint8)
+        est = vl.estimate_resting_posture(frame_bgr=frame)
+        self.assertIn("thetas_deg", est)
+        self.assertIn("cartesian_mm", est)
+        self.assertIn("T_0_6", est)
+        self.assertIsInstance(est["thetas_deg"], (list, tuple))
+        self.assertIsInstance(est["cartesian_mm"], dict)
+        self.assertTrue(isinstance(est["T_0_6"], (list, tuple, np.ndarray)))
+
+        transport = _SpyTransport()
+        try:
+            report = zero_jump_boot_sync(transport=transport, vision=vl)
+        except TypeError:
+            try:
+                report = zero_jump_boot_sync(transport=transport, vision_locator=vl)
+            except TypeError:
+                report = vl.zero_jump_boot_sync(transport=transport)
+        sent = [str(s).strip() for s in transport.sent]
+        self.assertGreaterEqual(len(sent), 3)
+        self.assertEqual(sent[0], "S")
+        z_idx = None
+        r_idx = None
+        for i, s in enumerate(sent):
+            if s.startswith("Z:"):
+                z_idx = i
+            if s == "R":
+                r_idx = i
+        self.assertIsNotNone(z_idx)
+        self.assertIsNotNone(r_idx)
+        self.assertLess(z_idx, r_idx)
+        self.assertTrue(report.get("zero_jump_verified") is True)
+        self.assertEqual(report.get("oe_sequence"), ["HIGH", "PRELOAD", "LOW"])
 
 
 if __name__ == "__main__":

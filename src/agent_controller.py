@@ -50,6 +50,17 @@ try:
 except Exception:
     _SimDevice = None
 
+# --- vision locator (may be written in parallel by another agent) ---
+try:
+    from .vision_locator import VisionLocator, zero_jump_boot_sync as _vz_sync
+except Exception:
+    try:
+        from vision_locator import VisionLocator, zero_jump_boot_sync as _vz_sync  # type: ignore
+    except Exception:
+        VisionLocator = None  # type: ignore
+
+        def _vz_sync(*args, **kwargs):  # type: ignore
+            return {"ok": False, "error": "vision_locator unavailable"}
 
 class _DualKeyDict(dict):
     """Dict whose keys are ints but also reachable via their str form."""
@@ -235,11 +246,14 @@ class AgentController:
         pose = self.get_current_pose()
         start_xyz = (float(pose["x_mm"]), float(pose["y_mm"]), float(pose["z_mm"]))
         grip = float(pose["grip_percent"])
+        start_pitch_deg = float(pose.get("pitch_deg", 90.0))
+        start_roll_deg = float(pose.get("roll_deg", 0.0))
         # validate whole path first
         waypoints = self.arm.move_linear_xyz(
             start_xyz, (float(x_mm), float(y_mm), float(z_mm)),
             pitch_deg=float(pitch_deg), roll_deg=float(roll_deg),
             grip_percent=grip, speed_mm_s=float(speed_mm_s), check_collision=True,
+            start_pitch_deg=start_pitch_deg, start_roll_deg=start_roll_deg,
         )
         commands: List[str] = []
         for wp in waypoints:
@@ -367,18 +381,23 @@ class AgentController:
         steps: List[str] = []
         step_pause = 0.0 if self.sim else 0.75
         lift_pause = 0.0 if self.sim else 1.5
-        # lift arm gently (slight forward reach + lift, then vertical HOME)
+        # Stage 0: Zero-Jump Boot Sync (preload resting posture, then R -> OE=LOW)
         try:
-            self.move_to_xyz(120.0, 0.0, 480.0, pitch_deg=60.0, speed_mm_s=90.0)
+            self.zero_jump_boot_sync()
+        except Exception:
+            try:
+                self.transport.send_line("R")
+            except Exception:
+                pass
+        # Step 1: lift to comfortable forward presentation pose
+        try:
+            self.move_to_xyz(140.0, 0.0, 430.0, pitch_deg=45.0, speed_mm_s=90.0)
             if lift_pause:
                 time.sleep(lift_pause)
-            self.move_to_xyz(0.0, 0.0, 570.0, pitch_deg=90.0, speed_mm_s=90.0)
-            if lift_pause:
-                time.sleep(lift_pause)
-            steps.append("home")
+            steps.append("lift")
         except Exception as e:
-            steps.append("home-failed: %s" % e)
-        # wave gripper (open / close / neutral salute)
+            steps.append("lift-failed: %s" % e)
+        # Step 2: salute with gripper
         for op in (100.0, 0.0, 50.0, 100.0, 50.0):
             try:
                 self.set_gripper(op)
@@ -387,7 +406,7 @@ class AgentController:
                 steps.append("gripper %s" % op)
             except Exception as e:
                 steps.append("gripper-failed: %s" % e)
-        # rotate wrist
+        # Step 3: rotate wrist
         for ang in (90.0, 180.0, 270.0, 0.0):
             try:
                 self.rotate_wrist(ang)
@@ -396,7 +415,7 @@ class AgentController:
                 steps.append("wrist %s" % ang)
             except Exception as e:
                 steps.append("wrist-failed: %s" % e)
-        # return home
+        # Step 4: return home
         try:
             self.move_to_xyz(0.0, 0.0, 570.0, pitch_deg=90.0, speed_mm_s=90.0)
             if lift_pause:
@@ -405,6 +424,97 @@ class AgentController:
         except Exception as e:
             steps.append("home-failed: %s" % e)
         return {"steps": steps, "pose": self.get_current_pose()}
+
+    def zero_jump_boot_sync(self, vision_url: Optional[str] = None,
+                            frame_bgr: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        result: Dict[str, Any] = {"stages": [], "ok": False}
+        # Try the canonical implementation from vision_locator first.
+        if _vz_sync is not None and VisionLocator is not None:
+            try:
+                vl = VisionLocator(
+                    endpoint_url=vision_url,
+                    state_manager=self.state,
+                    kinematics=self.arm,
+                )
+                out = _vz_sync(
+                    transport=self.transport,
+                    state_manager=self.state,
+                    kinematics=self.arm,
+                    vision_locator=vl,
+                    frame_bgr=frame_bgr,
+                )
+                if isinstance(out, dict):
+                    return out
+            except Exception:
+                pass
+        # Stage 1: OE=HIGH (disable outputs) - emergency stop
+        try:
+            self.transport.send_line("S")
+            result["stages"].append("OE=HIGH")
+        except Exception as e:
+            result["stages"].append("OE=HIGH-failed: %s" % e)
+        # Stage 2: Vision / FK T_0^6
+        angles = None
+        try:
+            pose = None
+            if VisionLocator is not None:
+                try:
+                    vl = VisionLocator(vision_url)
+                    try:
+                        pose = vl.get_pose(frame_bgr=frame_bgr)
+                    except Exception:
+                        try:
+                            pose = vl.get_pose(frame_bgr)
+                        except Exception:
+                            pose = None
+                except Exception:
+                    pose = None
+            if pose is None:
+                pose = self.get_current_pose()
+            result["stages"].append("Vision/FK T0^6")
+            angles = self._current_thetas()
+            if self.arm is not None:
+                try:
+                    fk = self.arm.forward_kinematics(angles)
+                    T = fk.get("T_0_6")
+                    if T is not None:
+                        result["T_0_6"] = [[float(v) for v in row] for row in T]
+                except Exception:
+                    pass
+        except Exception as e:
+            result["stages"].append("vision-failed: %s" % e)
+            angles = self._current_thetas()
+        # Stage 3: silent preload Z:... while OE=HIGH
+        try:
+            if angles is None:
+                angles = self._current_thetas()
+            servo = None
+            if self.arm is not None:
+                try:
+                    servo = self.arm.kinematic_to_servo_angles(angles)
+                except Exception:
+                    servo = None
+            if servo is None:
+                servo = {1: 50.0, 2: 0.0, 3: 90.0, 4: 90.0, 5: 90.0, 7: 0.0}
+            motors_list = [float(servo.get(i, 0.0)) for i in (1, 2, 3, 4, 5, 7)]
+            zcmd = "Z:" + ",".join(_fmt(v) for v in motors_list)
+            self.transport.send_line(zcmd)
+            result["stages"].append("Z preload")
+            result["preload_cmd"] = zcmd
+        except Exception as e:
+            result["stages"].append("Z-failed: %s" % e)
+        # Stage 4: R OE=LOW
+        try:
+            self.transport.send_line("R")
+            result["stages"].append("R OE=LOW")
+            result["ok"] = True
+        except Exception as e:
+            result["stages"].append("R-failed: %s" % e)
+        try:
+            self.state.update_from_thetas(self._current_thetas())
+        except Exception:
+            pass
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +633,12 @@ def demo_wave_and_twist() -> Dict[str, Any]:
     return get_default_controller().demo_wave_and_twist()
 
 
+def zero_jump_boot_sync(vision_url: Optional[str] = None,
+                       frame_bgr: Optional[np.ndarray] = None) -> Dict[str, Any]:
+    return get_default_controller().zero_jump_boot_sync(
+        vision_url=vision_url, frame_bgr=frame_bgr)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -542,6 +658,8 @@ def main(argv=None) -> int:
     parser.add_argument("--check-port", action="store_true")
     parser.add_argument("--pose", action="store_true")
     parser.add_argument("--demo", action="store_true")
+    parser.add_argument("--sync-boot", action="store_true")
+    parser.add_argument("--vision-url", default=None)
     args = parser.parse_args(argv)
 
     sim = bool(args.sim)
@@ -568,6 +686,11 @@ def main(argv=None) -> int:
 
         if args.demo:
             print(json.dumps(ctrl.demo_wave_and_twist(), indent=2, default=_json_default))
+            return 0
+
+        if args.sync_boot:
+            print(json.dumps(ctrl.zero_jump_boot_sync(vision_url=args.vision_url),
+                              indent=2, default=_json_default))
             return 0
 
         # default: print help-ish

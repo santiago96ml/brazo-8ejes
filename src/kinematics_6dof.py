@@ -291,40 +291,163 @@ class RobotArm6DOF:
         return J
 
     # ---------- move linear ----------
-    def move_linear_xyz(self, start_xyz, target_xyz, pitch_deg=0.0, roll_deg=0.0,
-                        grip_percent=50.0, num_waypoints=20, speed_mm_s=50.0,
-                        check_collision=True):
+    def move_linear_xyz(self, start_xyz, target_xyz, pitch_deg: float = 0.0, roll_deg: float = 0.0,
+                        grip_percent: float = 50.0, num_waypoints: int = 20, speed_mm_s: float = 50.0,
+                        check_collision: bool = True, start_pitch_deg: Optional[float] = None,
+                        start_roll_deg: Optional[float] = None):
         # resolve start
         if isinstance(start_xyz, dict):
             sx, sy, sz = float(start_xyz["x_mm"]), float(start_xyz["y_mm"]), float(start_xyz["z_mm"])
-            pitch_deg = float(start_xyz.get("pitch_deg", pitch_deg))
-            roll_deg = float(start_xyz.get("roll_deg", roll_deg))
+            if start_pitch_deg is None:
+                start_pitch_deg = float(start_xyz.get("pitch_deg", pitch_deg))
+            if start_roll_deg is None:
+                start_roll_deg = float(start_xyz.get("roll_deg", roll_deg))
             grip_percent = float(start_xyz.get("grip_percent", grip_percent))
         else:
             sx, sy, sz = [float(v) for v in start_xyz]
+            if start_pitch_deg is None:
+                start_pitch_deg = pitch_deg
+            if start_roll_deg is None:
+                start_roll_deg = roll_deg
         tx, ty, tz = [float(v) for v in target_xyz]
         start = np.array([sx, sy, sz], dtype=float)
         target = np.array([tx, ty, tz], dtype=float)
+
+        # First validate the final target_xyz at (pitch_deg, roll_deg, grip_percent)
+        if float(tz) < self.z_min_mm - 1e-9:
+            raise WorkspaceCollisionError(f"Target Z={tz:.2f} mm collides with table (z_min={self.z_min_mm} mm)")
+        try:
+            target_thetas = self.inverse_kinematics(
+                float(tx), float(ty), float(tz),
+                pitch_deg=pitch_deg, roll_deg=roll_deg, grip_percent=grip_percent,
+                check_collision=check_collision, enforce_limits=True,
+            )
+        except Exception as e:
+            if isinstance(e, WorkspaceCollisionError):
+                raise
+            raise WorkspaceCollisionError(str(e))
+
+        # Also if check_collision is True and any linear Cartesian point < z_min_mm
+        if check_collision:
+            for i in range(0, num_waypoints + 1):
+                alpha_c = i / num_waypoints if num_waypoints > 0 else 1.0
+                cxyz = start + (target - start) * alpha_c
+                if float(cxyz[2]) < self.z_min_mm - 1e-9:
+                    raise WorkspaceCollisionError(f"Waypoint Z={cxyz[2]:.2f} mm collides with table (z_min={self.z_min_mm} mm)")
+
+        # Infer start pitch if None
+        if start_pitch_deg is None:
+            if abs(sx) < 1e-6 and abs(sy) < 1e-6 and abs(sz - 570.0) < 1e-3:
+                start_pitch_deg = 90.0
+            else:
+                try:
+                    start_thetas_try = self.inverse_kinematics(
+                        float(sx), float(sy), float(sz),
+                        pitch_deg=pitch_deg, roll_deg=roll_deg, grip_percent=grip_percent,
+                        check_collision=False, enforce_limits=True,
+                    )
+                    # try to infer from FK
+                    fk_try = self.forward_kinematics(start_thetas_try, check_collision=False)
+                    start_pitch_deg = float(fk_try.get("pitch_deg", 90.0))
+                except Exception:
+                    start_pitch_deg = 90.0
+        if start_roll_deg is None:
+            start_roll_deg = roll_deg
+
+        # Get start thetas for joint space interpolation if needed
+        try:
+            start_thetas = self.inverse_kinematics(
+                float(sx), float(sy), float(sz),
+                pitch_deg=start_pitch_deg, roll_deg=start_roll_deg, grip_percent=grip_percent,
+                check_collision=check_collision, enforce_limits=True,
+            )
+        except Exception:
+            try:
+                start_thetas = self.inverse_kinematics(
+                    float(sx), float(sy), float(sz),
+                    pitch_deg=pitch_deg, roll_deg=roll_deg, grip_percent=grip_percent,
+                    check_collision=check_collision, enforce_limits=True,
+                )
+            except Exception as e:
+                if isinstance(e, WorkspaceCollisionError):
+                    raise
+                start_thetas = list(self.home_thetas_deg)
+
         dist = float(np.linalg.norm(target - start))
         total_time_s = dist / float(speed_mm_s) if speed_mm_s > 0 else 1.0
         if num_waypoints < 1:
             num_waypoints = 1
         interval_ms = (total_time_s * 1000.0) / num_waypoints
         out = []
+        D_limit = float(self.L2 + self.L3)
         for i in range(1, num_waypoints + 1):
             alpha = i / num_waypoints
             xyz = start + (target - start) * alpha
-            thetas = self.inverse_kinematics(
-                float(xyz[0]), float(xyz[1]), float(xyz[2]),
-                pitch_deg=pitch_deg, roll_deg=roll_deg, grip_percent=grip_percent,
-                check_collision=check_collision, enforce_limits=True,
-            )
+            wx, wy, wz = float(xyz[0]), float(xyz[1]), float(xyz[2])
+            wp_pitch = float(start_pitch_deg) + alpha * (float(pitch_deg) - float(start_pitch_deg))
+            wp_roll = float(start_roll_deg) + alpha * (float(roll_deg) - float(start_roll_deg))
+            thetas = None
+            # Try Cartesian interpolation first with interpolated pitch
+            try:
+                thetas = self.inverse_kinematics(
+                    wx, wy, wz,
+                    pitch_deg=wp_pitch, roll_deg=wp_roll, grip_percent=grip_percent,
+                    check_collision=check_collision, enforce_limits=True,
+                )
+            except Exception:
+                thetas = None
+            # If intermediate waypoint is slightly outside spherical boundary D = L2+L3
+            # because straight line cuts outside sphere while pitching, smoothly interpolate in joint space
+            if thetas is None or (i < num_waypoints):
+                r_wp = math.hypot(wx, wy)
+                # Check if outside boundary
+                outside_boundary = False
+                if thetas is None:
+                    outside_boundary = True
+                else:
+                    # Also check if very close to boundary issues
+                    if r_wp > D_limit + 1e-6:
+                        outside_boundary = True
+                if outside_boundary and i < num_waypoints:
+                    # Interpolate in joint space
+                    thetas_js = []
+                    for j in range(len(start_thetas)):
+                        thetas_js.append((1.0 - alpha) * float(start_thetas[j]) + alpha * float(target_thetas[j]))
+                    thetas = thetas_js
+                    # Verify with forward kinematics
+                    try:
+                        self.forward_kinematics(thetas, check_collision=check_collision)
+                    except Exception as e:
+                        if isinstance(e, WorkspaceCollisionError) and check_collision:
+                            raise
+                        # try to recover with IK
+                        try:
+                            thetas = self.inverse_kinematics(
+                                wx, wy, wz,
+                                pitch_deg=wp_pitch, roll_deg=wp_roll, grip_percent=grip_percent,
+                                check_collision=check_collision, enforce_limits=True,
+                            )
+                        except Exception as e2:
+                            if isinstance(e2, WorkspaceCollisionError):
+                                raise
+                            raise
+                elif thetas is None and i == num_waypoints:
+                    thetas = target_thetas
+                elif thetas is None:
+                    # try joint space anyway
+                    thetas_js = []
+                    for j in range(len(start_thetas)):
+                        thetas_js.append((1.0 - alpha) * float(start_thetas[j]) + alpha * float(target_thetas[j]))
+                    thetas = thetas_js
             if check_collision:
-                self.forward_kinematics(thetas, check_collision=True)
+                try:
+                    self.forward_kinematics(thetas, check_collision=True)
+                except WorkspaceCollisionError:
+                    raise
             servo = self.kinematic_to_servo_angles(thetas)
             out.append({
                 "waypoint_index": i - 1,
-                "xyz_mm": [float(xyz[0]), float(xyz[1]), float(xyz[2])],
+                "xyz_mm": [wx, wy, wz],
                 "thetas_deg": [float(v) for v in thetas],
                 "servo_angles": servo,
                 "duration_ms": float(interval_ms),

@@ -212,6 +212,55 @@ class RobotStateManager:
         return "G:%d,%d,%d,%d,%d,%d,%d" % (m1, m2, m3, m4, m5r, m7,
                                             int(duration_ms))
 
+    def build_preload_command(self, motors_deg: Dict[int, float]) -> str:
+        """Build silent PWM preload command ``Z:m1,..,m5,m7``.
+
+        Validates the shoulder coupling on motors 5/6, computes the coupled
+        motor 6 angle, updates persisted state, and returns the firmware
+        command string used while ``PIN_OE`` is still ``HIGH``.
+        """
+        md: Dict[int, float] = {}
+        for key, value in (motors_deg or {}).items():
+            md[int(key)] = float(value)
+
+        coupling = self.state.get("shoulder_coupling", 1)
+        m5 = float(md.get(5, self.state.get("motors_deg", {}).get("5", 0.0) or 0.0))
+        if 6 in md:
+            self.validate_shoulder_pair(m5, float(md[6]))
+        m6 = self.compute_coupled_shoulder_angle(m5, coupling)
+        md[6] = float(m6)
+
+        # Update persisted motor state (motors 1..8 and PCA channels).
+        for motor, value in md.items():
+            mi = int(motor)
+            if 1 <= mi <= 8:
+                self.state.setdefault("motors_deg", {})[str(mi)] = float(value)
+                self.state.setdefault("pca9685_channels_deg", {})[str(mi - 1)] = float(value)
+
+        self.state["timestamp"] = self._now()
+
+        hist = self.state.setdefault("command_history", [])
+        hist.append({"timestamp": self._now(), "cmd": "Z",
+                     "summary": "preload motors=%s" % md})
+        if len(hist) > self.max_history:
+            del hist[: len(hist) - self.max_history]
+
+        self._save()
+
+        def _motor_value(motor: int) -> float:
+            if motor in md:
+                return float(md[motor])
+            stored = self.state.get("motors_deg", {}).get(str(motor), 0.0)
+            return float(stored) if stored is not None else 0.0
+
+        m1 = round(_motor_value(1))
+        m2 = round(_motor_value(2))
+        m3 = round(_motor_value(3))
+        m4 = round(_motor_value(4))
+        m5r = round(_motor_value(5))
+        m7 = round(_motor_value(7))
+        return "Z:%d,%d,%d,%d,%d,%d" % (m1, m2, m3, m4, m5r, m7)
+
     def update_from_thetas(self, thetas_deg, command_str: Optional[str] = None) -> Dict[str, Any]:
         thetas = [float(x) for x in thetas_deg]
         self.state["thetas_deg"] = thetas
