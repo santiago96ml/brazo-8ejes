@@ -95,3 +95,48 @@ Classic ESP32 boards usually use RX 16 / TX 17; set the pins in
 6. First power-up with the arm unloaded. The firmware boots with the outputs
    disabled and prints `{"status":"READY",...}`; nothing should move.
 7. Send `I` and confirm `CONECTADO_0x40` before sending any move.
+
+## 6. Overheating diagnosis (do this before powering again)
+
+A cable that gets hot is carrying more current than its gauge allows, or the current
+is returning through a path that was never sized for it. `P = I^2 * R`: **raising the
+supply current limit never makes a cable cooler**, it only allows more current (and
+more heat) before the supply gives up. A bench supply's current limit is a ceiling,
+not a thermostat.
+
+Ranked causes seen in this build:
+
+1. **Servo current returning through the logic ground.** The PCA9685 side `GND` pin
+   and the thin Dupont wires are for logic only (a few mA). The seven servos must
+   return through the **screw terminal `GND`** with the same gauge as `V+`. If the
+   servo return goes through a Dupont wire, that wire becomes the bottleneck and
+   overheats while the motor still works.
+2. **Wire gauge too small for the rail.** 7x MG946R at 5 V: ~0.2 A each idle,
+   ~0.6-1.0 A each moving, **~2.4 A each stalled**. Seven stalled = ~17 A. Use
+   16-18 AWG from the supply to a distribution block, 20-22 AWG per servo pigtail.
+3. **Supply far below the load.** A 5 V / 2.7 A supply cannot move seven servos: it
+   enters current limit, the rail collapses, every servo stalls, and the wires cook
+   at the limit. At 2.5 A the arm "did not move" for exactly this reason. That is not
+   a tuning problem, it is a sizing problem.
+
+### Checks with the supply OFF
+
+1. Disconnect the servos. Measure `V+` to `GND` at the PCA9685 terminal: it must read
+   open (no continuity). Any continuity is a short - find it before powering.
+2. Check polarity: supply `+` to terminal `V+`, supply `-` to terminal `GND`.
+3. Identify every wire that got hot and trace where it goes. If it is a Dupont wire
+   between the Mega/PCA9685 side header and the supply, it is a return-path error,
+   not a load error.
+4. Verify the star ground: PSU `-`, terminal `GND`, side `GND`, Mega `GND` are one
+   node, and no servo current crosses the Mega board.
+5. Only then connect **one** servo and test at 5.0 V with the current limit at 1 A.
+   A single MG946R moving freely stays under ~0.8 A. If it hits the limit while
+   moving freely, the servo or its wiring is faulty.
+
+### Required supply
+
+- 5 V, **>= 10 A continuous** for normal motion, 15-20 A peak (7x MG946R).
+  A 5 V / 2.7 A unit is for one or two servos on the bench, never for the arm.
+- 20 A fuse on the rail, 16 AWG main run, distribution block, 1000-2200 uF bulk
+  capacitor at the rail.
+- Never raise the current limit to force movement. Fix the cause.
