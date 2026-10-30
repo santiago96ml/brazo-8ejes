@@ -366,6 +366,10 @@ static void processPort(HardwareSerial& ser, uint8_t port) {
       handleLine(tmp, port);
     } else if (c == '\r') {
       // ignore
+    } else if ((uint8_t)c < 0x20 || (uint8_t)c > 0x7E) {
+      // ignore non-ASCII boot noise from ESP8266/ESP32 UART
+    } else if (port == 1 && *len == 0 && (c == 'x' || c == 'f')) {
+      // ignore raw 'x'/'f' watchdog bytes injected by legacy tanque ESP8266 firmware
     } else {
       if (*len < 255) buf[(*len)++] = c;
       else { *len = 0; }
