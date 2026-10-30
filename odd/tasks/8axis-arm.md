@@ -92,6 +92,18 @@ S14 — Live monitoring HUD (`src/live_vision_hud.py`):
 S15 — Pulse odometry bridge (`src/pulse_odometry.py`):
 - Converts PCA9685 pulse ↔ motor degrees ↔ kinematic thetas for all 8 motors using the calibrated `pulse_min`/`pulse_stop`/`pulse_max` and `home` anchoring, with shoulder coupling (motor 6 = master if coupling +1, else `180 - master`).
 
+S16 — UVC colour control (`src/fast_camera.py`):
+- Optional `auto_wb`, `wb_temperature` (4600 K), `saturation`, `brightness`, `contrast`, `gain`, `sharpness` applied best-effort after format negotiation; MSMF may ignore unsupported controls.
+- `ArmVisionAnalyzer` applies CLAHE on the LAB `L` channel before HSV segmentation (`use_clahe=True`, `clahe_clip=2.0`) to counter the blue room cast.
+
+S17 — Camera-guided pulse calibration (`src/visual_pulse_calibrator.py`):
+- `VisualPulseCalibrator` with `zero_sync()` (`S` → vision read → `Z:...` → `R`), `measure_stop_point()` sweeping 304..311 and picking the pulse with near-zero pixel displacement, `measure_speed()` with 200 ms bursts on both directions computing `deg_per_ms_pos/neg`, `calibrate_motor()`, `calibrate_all()` and `save_profile()` writing `config/servo_pulse_profile.json` + `C<motor>:<stop>:<dps>` + `E`.
+- Motors 5 and 6 are never calibrated independently (master 5, mirrored 6).
+
+S18 — Automatic dataset collection and YOLO11-pose training (`tools/auto_collect_dataset.py`, `tools/train_arm_keypoints.py`):
+- Collector moves through 100 safe poses, requires >=4 ArUco markers, optionally inpaints the marker squares, and saves via `DatasetRecorder`.
+- Trainer writes `dataset/arm_pose.yaml` with `kpt_shape: [6, 3]`, trains `yolo11n-pose.pt`, and exports `models/arm_keypoints.onnx`; it detects a CPU-only torch / missing ultralytics and returns the exact install commands instead of crashing.
+
 ## Tasks
 
 | ID | Specs | Route | Status | Commit |

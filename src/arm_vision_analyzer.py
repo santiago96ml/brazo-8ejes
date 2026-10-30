@@ -151,6 +151,9 @@ class ArmVisionAnalyzer:
         hsv_lower: tuple = (85, 60, 40),
         hsv_upper: tuple = (135, 255, 255),
         blue_ratio: float = 1.25,
+        use_clahe: bool = True,
+        clahe_clip: float = 2.0,
+        clahe_grid: int = 8,
     ):
         if cv2 is not None and aruco_dict is None:
             aruco_dict = cv2.aruco.DICT_4X4_50
@@ -161,6 +164,12 @@ class ArmVisionAnalyzer:
         self.hsv_lower = tuple(hsv_lower)
         self.hsv_upper = tuple(hsv_upper)
         self.blue_ratio = float(blue_ratio)
+        self.use_clahe = bool(use_clahe)
+        self._clahe = (
+            cv2.createCLAHE(clipLimit=float(clahe_clip), tileGridSize=(int(clahe_grid), int(clahe_grid)))
+            if (cv2 is not None and self.use_clahe)
+            else None
+        )
 
     # ---------- helpers ----------
     def _load_joint_limits(self) -> dict:
@@ -224,6 +233,13 @@ class ArmVisionAnalyzer:
         # Segment at half resolution: 4x fewer pixels keeps the mask under ~7 ms
         # on a 720p stream, then upsample the binary mask (nearest) for the caller.
         small = cv2.resize(frame, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+        if self.use_clahe:
+            # CLAHE on L (LAB) lifts the local contrast that the blue room cast flattens,
+            # which is what makes the dark navy links separable from the wall.
+            lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)
+            l_chan, a_chan, b_chan = cv2.split(lab)
+            l_chan = self._clahe.apply(l_chan)
+            small = cv2.cvtColor(cv2.merge([l_chan, a_chan, b_chan]), cv2.COLOR_LAB2BGR)
         hsv_small = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
         lower = np.array(self.hsv_lower, dtype=np.uint8)
         upper = np.array(self.hsv_upper, dtype=np.uint8)

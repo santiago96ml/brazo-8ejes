@@ -119,3 +119,77 @@ The HUD analyzes every second frame (`analyze_every=2`) because one analysis cos
 All coordinates normalized to [0,1]; `v = 2` visible, `1` low confidence, `0` missing.
 `dataset/images/000001.jpg` is the raw frame and `000001.json` carries
 `thetas_deg`, `motors_deg`, `T_0_6`, `cartesian_mm`, timestamp and source mode.
+
+## UVC colour control and CLAHE
+
+`FastUSBCamera` accepts `auto_wb`, `wb_temperature`, `saturation`,
+`brightness`, `contrast`, `gain` and `sharpness`; they are applied after the
+format negotiation and are best-effort (MSMF silently ignores unsupported controls).
+Recommended starting point for the blue cast:
+
+`python
+FastUSBCamera(index=0, auto_wb=0, wb_temperature=4600, saturation=160)
+`
+
+On the analyzer side, `ArmVisionAnalyzer(use_clahe=True)` (default) applies CLAHE
+on the LAB `L` channel at segmentation resolution. Measured on the saved real
+frame: the blue mask drops from 166 212 px to 88 464 px (less wall bleed) while the
+skeleton stays identical, and steady-state analysis costs ~21 ms instead of ~18 ms.
+
+## Camera-guided pulse calibration
+
+src/visual_pulse_calibrator.py closes the loop between the camera, the Mega and
+the 360-degree servos:
+
+`powershell
+# Dry run: no serial, no camera, prints the plan
+python -m src.visual_pulse_calibrator --dry-run --motors 2 --json
+
+# Real calibration of one motor (camera index 0, Mega on COM4)
+python -m src.visual_pulse_calibrator --port COM4 --camera 0 --motor 2
+`
+
+Stages per motor: S (OE HIGH) -> vision read -> Z:... preload -> R;
+then a 304..311 sweep picking the pulse with the smallest pixel displacement
+(< 0.35 px/s), then two 200 ms bursts to measure deg_per_ms_pos and
+deg_per_ms_neg. Results are written to config/servo_pulse_profile.json and
+pushed to the Mega (C<motor>:<stop>:<dps> + E). Motors 5 and 6 are calibrated
+as one pair (master 5, mirrored 6).
+
+**The camera is exclusive**: close any open HUD window before calibrating, otherwise
+MSMF opens the device but cannot grab frames.
+
+## Dataset collection and YOLO11-pose training
+
+`powershell
+python tools\auto_collect_dataset.py --camera 0 --count 100 --out dataset --inpaint
+python tools\train_arm_keypoints.py --dataset dataset --epochs 100 --imgsz 640 --model yolo11n-pose.pt --export-onnx
+`
+
+uto_collect_dataset.py walks 100 deterministic safe poses (radius 120..320 mm,
+Z 200..520 mm, pitch 30..80 deg), requires at least 4 ArUco markers, optionally
+inpaints the marker squares so the network learns the blue link and black servo,
+and writes image + YOLO-keypoint label + JSON sidecar through DatasetRecorder.
+
+	rain_arm_keypoints.py builds dataset/arm_pose.yaml (kpt_shape: [6, 3],
+keypoints ase, shoulder, elbow, wrist_pitch, wrist_roll, gripper_tip), trains
+yolo11n-pose.pt, and exports models/arm_keypoints.onnx for
+ArmVisionAnalyzer(mode="neural").
+
+### Current host prerequisite (checked on 2026-10-30)
+
+`	ext
+torch          2.12.0+cpu   -> CUDA unavailable in this Python environment
+ultralytics    not installed
+GPU            NVIDIA RTX 4050 Laptop 6 GB (driver 616.92)
+`
+
+Training therefore cannot run yet. Install the CUDA build and ultralytics:
+
+`powershell
+python -m pip install --upgrade ultralytics
+python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision
+`
+
+python -c "from tools.train_arm_keypoints import check_environment; print(check_environment())"
+reports readiness and prints the same hint.

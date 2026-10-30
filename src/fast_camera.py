@@ -23,6 +23,13 @@ class FastUSBCamera:
         backend: Any = "auto",
         exposure: float | None = None,
         auto_exposure: float | None = None,
+        auto_wb: int | None = None,
+        wb_temperature: int | None = None,
+        saturation: int | None = None,
+        brightness: int | None = None,
+        contrast: int | None = None,
+        gain: int | None = None,
+        sharpness: int | None = None,
         capture: Any | None = None,
         warmup_frames: int = 8,
     ):
@@ -34,6 +41,13 @@ class FastUSBCamera:
         self.backend = backend
         self.exposure = exposure
         self.auto_exposure = auto_exposure
+        self.auto_wb = auto_wb
+        self.wb_temperature = wb_temperature
+        self.saturation = saturation
+        self.brightness = brightness
+        self.contrast = contrast
+        self.gain = gain
+        self.sharpness = sharpness
         self._capture_injected = capture
         self._warmup_remaining = max(0, int(warmup_frames))
         self._resolved_backend = self._resolve_backend(backend, width, height)
@@ -89,6 +103,21 @@ class FastUSBCamera:
             cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, self.auto_exposure)
         if self.exposure is not None:
             cap.set(cv2.CAP_PROP_EXPOSURE, self.exposure)
+        # UVC colour controls: best-effort, some MSMF drivers ignore them.
+        if self.auto_wb is not None:
+            cap.set(cv2.CAP_PROP_AUTO_WB, self.auto_wb)
+        if self.wb_temperature is not None:
+            cap.set(cv2.CAP_PROP_WB_TEMPERATURE, self.wb_temperature)
+        if self.saturation is not None:
+            cap.set(cv2.CAP_PROP_SATURATION, self.saturation)
+        if self.brightness is not None:
+            cap.set(cv2.CAP_PROP_BRIGHTNESS, self.brightness)
+        if self.contrast is not None:
+            cap.set(cv2.CAP_PROP_CONTRAST, self.contrast)
+        if self.gain is not None:
+            cap.set(cv2.CAP_PROP_GAIN, self.gain)
+        if self.sharpness is not None:
+            cap.set(cv2.CAP_PROP_SHARPNESS, self.sharpness)
 
     def _open_capture(self):
         candidates = [self._resolved_backend]
