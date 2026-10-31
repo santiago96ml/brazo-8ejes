@@ -97,19 +97,33 @@ class TestVisualPulseCalibrator(unittest.TestCase):
         cal = VisualPulseCalibrator(camera=cam, analyzer=ana, controller=ctrl, dry_run=False)
         res = cal.zero_sync()
         sent = ctrl.transport.sent
-        self.assertTrue(len(sent) >= 3)
+        self.assertTrue(len(sent) >= 2)
         self.assertEqual(sent[0], "S")
-        # find Z and R
-        z_idx = -1
-        r_idx = -1
-        for i, s in enumerate(sent):
-            if str(s).startswith("Z:"):
-                z_idx = i
-            if str(s).strip() == "R":
-                r_idx = i
+        self.assertIn("R", [str(s).strip() for s in sent])
+        # The fake analyzer reports mode "aruco", so a preload is allowed here.
+        z_idx = next((i for i, s in enumerate(sent) if str(s).startswith("Z:")), -1)
+        r_idx = next((i for i, s in enumerate(sent) if str(s).strip() == "R"), -1)
         self.assertTrue(z_idx > 0)
         self.assertTrue(r_idx > z_idx)
         self.assertEqual(res["preloaded"], True)
+
+    def test_zero_sync_skips_preload_without_aruco(self):
+        cam = _FakeCamera()
+        ana = _FakeAnalyzer()
+        ana.analyze = lambda frame: {
+            "keypoints_px": {}, "thetas_deg": [0.0, 90.0, 0.0, 0.0, 0.0, 50.0],
+            "mode_used": "geometric", "confidence": 0.5, "cartesian_mm": None,
+        }
+        ctrl = type("C", (), {})()
+        ctrl.transport = _FakeTransport()
+        ctrl.state = type("S", (), {"update_from_thetas": lambda self, t: None})()
+        cal = VisualPulseCalibrator(camera=cam, analyzer=ana, controller=ctrl, dry_run=False)
+        res = cal.zero_sync()
+        sent = [str(s) for s in ctrl.transport.sent]
+        self.assertEqual(sent[0], "S")
+        self.assertFalse(any(s.startswith("Z:") for s in sent))
+        self.assertEqual(res["preloaded"], False)
+        self.assertIsNotNone(res.get("preload_skipped"))
 
     def test_measure_stop_point_picks_smallest_motion(self):
         cam = _FakeCamera()
