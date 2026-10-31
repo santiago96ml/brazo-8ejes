@@ -173,6 +173,7 @@ class ArmVisionAnalyzer:
             if (cv2 is not None and self.use_clahe)
             else None
         )
+        self._prev_keypoints_px = None
 
     # ---------- helpers ----------
     def _load_joint_limits(self) -> dict:
@@ -358,6 +359,44 @@ class ArmVisionAnalyzer:
                 out.append((float(pt[0]), float(pt[1])))
         return out
 
+    def _local_mask_centroid(self, mask, point, radius: int = 28) -> tuple[float, float]:
+        """Return the mask centroid within a circular neighborhood of a milestone."""
+        height, width = mask.shape[:2]
+        center_x, center_y = float(point[0]), float(point[1])
+        x0 = max(0, int(math.floor(center_x - radius)))
+        x1 = min(width, int(math.ceil(center_x + radius)) + 1)
+        y0 = max(0, int(math.floor(center_y - radius)))
+        y1 = min(height, int(math.ceil(center_y + radius)) + 1)
+        if x0 >= x1 or y0 >= y1:
+            return center_x, center_y
+
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        disk = (xx - center_x) ** 2 + (yy - center_y) ** 2 <= radius ** 2
+        local_mask = np.where(disk, mask[y0:y1, x0:x1], 0).astype(np.uint8)
+        moments = cv2.moments(local_mask, binaryImage=True)
+        if moments["m00"] <= 0:
+            return center_x, center_y
+        return (
+            float(x0 + moments["m10"] / moments["m00"]),
+            float(y0 + moments["m01"] / moments["m00"]),
+        )
+
+    def _smooth_keypoints(self, keypoints: dict) -> dict:
+        """Apply an EMA to nearby frame-to-frame keypoints, resetting large jumps."""
+        smoothed = {}
+        previous = self._prev_keypoints_px or {}
+        current_points = {}
+        for name, values in keypoints.items():
+            x, y = float(values[0]), float(values[1])
+            prev = previous.get(name)
+            if prev is not None and math.hypot(x - prev[0], y - prev[1]) <= 35.0:
+                x = 0.25 * x + 0.75 * prev[0]
+                y = 0.25 * y + 0.75 * prev[1]
+            current_points[name] = (x, y)
+            smoothed[name] = (x, y, *values[2:])
+        self._prev_keypoints_px = current_points
+        return smoothed
+
     def _geometric(self, frame):
         if cv2 is None or np is None:
             return None
@@ -453,7 +492,9 @@ class ArmVisionAnalyzer:
         # search to the middle of the path so a straight arm remains unchanged.
         apex_index = min(range(30, 71), key=lambda index: samples[index][1])
         sampled[2] = samples[apex_index]
-        base, shoulder, elbow, wrist, wrist_roll, tip = sampled
+        base, shoulder, elbow, wrist, wrist_roll, tip = [
+            self._local_mask_centroid(sel_mask, point) for point in sampled
+        ]
         kp = {
             "base": (float(base[0]), float(base[1]), 0.8),
             "shoulder": (float(shoulder[0]), float(shoulder[1]), 0.8),
@@ -462,6 +503,7 @@ class ArmVisionAnalyzer:
             "wrist_roll": (float(wrist_roll[0]), float(wrist_roll[1]), 0.6),
             "gripper_tip": (float(tip[0]), float(tip[1]), 0.7),
         }
+        kp = self._smooth_keypoints(kp)
         thetas = self._derive_angles(kp)
         if thetas is None:
             return None

@@ -170,7 +170,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         with FastUSBCamera(index=args.camera, width=1280, height=720, fps=30) as cam:
-            # MSMF may suppress its first warm-up frames; wait for publication.
+            # Discard the camera's auto-exposure and white-balance settling period.
+            warmup_deadline = time.monotonic() + 1.2
+            while time.monotonic() < warmup_deadline:
+                cam.get_latest_frame()
+                time.sleep(0.005)
+
+            # MSMF may suppress its first frames; wait briefly for a published frame.
             first_frame_deadline = time.monotonic() + 5.0
             frame = None
             while time.monotonic() < first_frame_deadline:
@@ -179,10 +185,17 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 time.sleep(0.005)
             stats = cam.stats()
+            backend_id = getattr(cam, "_resolved_backend", None)
+            if cv2 is not None and backend_id == cv2.CAP_MSMF:
+                backend_name = "CAP_MSMF"
+            elif cv2 is not None and backend_id == cv2.CAP_DSHOW:
+                backend_name = "CAP_DSHOW"
+            else:
+                backend_name = "unknown"
             camera_status = {
                 "fps": float(stats.get("fps", 0.0)),
                 "resolution": [int(stats.get("width", 1280)), int(stats.get("height", 720))],
-                "backend": stats.get("fourcc", "unknown"),
+                "backend": backend_name,
             }
 
             if args.calibrate_zero and frame is not None:
@@ -207,6 +220,10 @@ def main(argv: list[str] | None = None) -> int:
                     "max_variance_deg2": 999.0,
                     "reason": f"error:{e}",
                 }
+            # The audit consumes another 10 settling and 30 measured frames;
+            # report the latest measured stream rate rather than startup state.
+            stats = cam.stats()
+            camera_status["fps"] = float(stats.get("fps", 0.0))
 
             optical_audit = {
                 "passed": bool(audit_res.get("passed", False)),

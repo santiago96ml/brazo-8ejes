@@ -70,6 +70,40 @@ def test_geometric_traces_folded_arm_from_base_to_gripper():
     assert keypoints["gripper_tip"][1] > keypoints["elbow"][1]
 
 
+def test_local_mask_centroid_ignores_pixels_outside_radius():
+    analyzer = ArmVisionAnalyzer(mode="geometric")
+    mask = np.zeros((120, 120), dtype=np.uint8)
+    mask[40:61, 40:61] = 255
+    mask[45:56, 90:101] = 255
+
+    centroid = analyzer._local_mask_centroid(mask, (50.0, 50.0))
+
+    assert centroid == (50.0, 50.0)
+
+
+def test_keypoint_smoothing_uses_ema_and_resets_large_jumps():
+    analyzer = ArmVisionAnalyzer(mode="geometric")
+    first = {
+        name: (float(index * 10), float(index * 10), 0.8)
+        for index, name in enumerate(analyzer.KEYPOINT_ORDER)
+    }
+    initial = analyzer._smooth_keypoints(first)
+    shifted = {
+        name: (point[0] + 4.0, point[1] + 4.0, point[2])
+        for name, point in first.items()
+    }
+
+    smoothed = analyzer._smooth_keypoints(shifted)
+
+    for name, point in first.items():
+        assert smoothed[name] == (point[0] + 1.0, point[1] + 1.0, point[2])
+    jumped = dict(shifted)
+    jumped["base"] = (50.0, 50.0, 0.8)
+    reset = analyzer._smooth_keypoints(jumped)
+    assert reset["base"] == (50.0, 50.0, 0.8)
+    assert initial["base"] == first["base"]
+
+
 def test_neural_predictor_unavailable():
     p = KeypointNeuralPredictor()
     assert p.available is False

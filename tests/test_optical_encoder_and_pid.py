@@ -169,11 +169,11 @@ def test_encoder_filter_initializes_from_first_frame_and_clamps_velocity_dt():
 
 def test_optical_audit_warms_up_before_evaluating_requested_frames():
     encoder = VirtualOpticalEncoder()
-    frames = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(33)]
+    frames = [np.full((8, 8, 3), i, dtype=np.uint8) for i in range(40)]
     calls = []
 
     def read_positions(frame, timestamp_s=None):
-        calls.append((frame, timestamp_s))
+        calls.append((int(frame[0, 0, 0]), timestamp_s))
         return {
             "thetas_deg": [0.0] * 6,
             "mode_used": "geometric_fallback",
@@ -183,7 +183,8 @@ def test_optical_audit_warms_up_before_evaluating_requested_frames():
     encoder.read_positions = read_positions
     audit = encoder.audit_pre_power(DummyCamera(frames), num_frames=30)
 
-    assert len(calls) == 33
+    assert [frame_index for frame_index, _ in calls[:10]] == list(range(10))
+    assert [frame_index for frame_index, _ in calls[10:]] == list(range(10, 40))
     assert audit["frames_evaluated"] == 30
 
 

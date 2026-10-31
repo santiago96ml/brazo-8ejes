@@ -389,7 +389,8 @@ class VirtualOpticalEncoder:
         self._last_t = None
         self._initialized = False
         requested_frames = max(0, int(num_frames))
-        capture_count = requested_frames + 3
+        warmup_count = 10
+        capture_count = requested_frames + warmup_count
         frames = []
         try:
             # FastUSBCamera publishes one latest frame repeatedly until its
@@ -449,11 +450,11 @@ class VirtualOpticalEncoder:
                 "reason": "no_frames_captured",
             }
 
-        # Warm up with distinct leading frames, then evaluate the requested
-        # number of following frames. Finite test/replay inputs may only expose
-        # the requested count, in which case retain their full evaluation set.
-        warmup_frames = frames[:3]
-        evaluation_frames = frames[3:3 + requested_frames]
+        # Warm up the temporal filter before accumulating the requested sample.
+        # Finite replay inputs may expose only the evaluation count; in that
+        # case reuse those frames for evaluation after the warm-up pass.
+        warmup_frames = frames[:warmup_count]
+        evaluation_frames = frames[warmup_count:warmup_count + requested_frames]
         if len(frames) < capture_count:
             evaluation_frames = frames[:requested_frames]
         start_time = time.time()
