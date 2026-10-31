@@ -152,3 +152,15 @@ def test_neural_predictor_unavailable():
     p = KeypointNeuralPredictor()
     assert p.available is False
     assert p.predict(np.zeros((100, 100, 3), dtype=np.uint8)) is None
+
+
+def test_wrist_roll_uses_signed_dark_servo_silhouette_asymmetry():
+    hsv = np.zeros((100, 160, 3), dtype=np.uint8)
+    hsv[:, :, 2] = 255
+    hsv[55:76, 20:141] = (0, 0, 0)
+
+    theta5 = ArmVisionAnalyzer._estimate_wrist_roll(
+        hsv, (20.0, 50.0), (140.0, 50.0), (1.0, 0.0)
+    )
+
+    assert 0.0 < theta5 <= 90.0

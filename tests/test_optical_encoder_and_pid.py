@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from src.virtual_optical_encoder import VirtualOpticalEncoder
+from src.arm_vision_analyzer import ArmVisionAnalyzer
 from src.pid_pwm_controller import (
     NonlinearPIDController,
     DEFAULT_JOINT_CONFIGS,
@@ -35,6 +36,30 @@ class DummyCamera:
             self._i += 1
             return True, f
         return False, None
+
+
+def test_folded_arm_wrist_segments_follow_fixed_physical_proportions():
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    cv2.line(mask, (760, 310), (950, 490), 255, 48)
+    cv2.line(mask, (950, 490), (950, 640), 255, 48)
+    cv2.line(mask, (760, 310), (625, 525), 255, 48)
+    cv2.line(mask, (625, 525), (505, 625), 255, 48)
+    cv2.line(mask, (505, 625), (380, 685), 255, 48)
+    analyzer = ArmVisionAnalyzer(mode="geometric")
+    analyzer._blue_mask = lambda _frame: (mask, np.zeros((*mask.shape, 3), dtype=np.uint8))
+
+    geometry = analyzer._geometric(image)
+
+    assert geometry is not None
+    keypoints = geometry[1]
+    wrist_pitch = np.asarray(keypoints["wrist_pitch"][:2], dtype=float)
+    wrist_roll = np.asarray(keypoints["wrist_roll"][:2], dtype=float)
+    gripper_tip = np.asarray(keypoints["gripper_tip"][:2], dtype=float)
+    pitch_to_roll = np.linalg.norm(wrist_roll - wrist_pitch)
+    roll_to_gripper = np.linalg.norm(gripper_tip - wrist_roll)
+    assert pitch_to_roll > 0.0
+    assert abs(pitch_to_roll / roll_to_gripper - 55.0 / 120.0) < 1e-6
 
 
 def _draw_aruco_marker(img, corner, marker_id, size=50):

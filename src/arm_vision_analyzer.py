@@ -175,6 +175,60 @@ class ArmVisionAnalyzer:
         self._prev_keypoints_px = None
         self._kp_history = []
         self._prev_mask_centroid = None
+        self._link_lengths_mm = None
+
+    def _load_link_lengths(self) -> dict:
+        """Load the physical link lengths once, with the audited arm as fallback."""
+        if self._link_lengths_mm is not None:
+            return self._link_lengths_mm
+        lengths = {"L1": 115.0, "L2": 145.0, "L3": 135.0, "L4": 55.0, "d5": 45.0, "L6_finger": 75.0}
+        try:
+            import json
+
+            path = os.path.join(REPO_ROOT, "config", "config_geometria.json")
+            with open(path, "r", encoding="utf-8") as geometry_file:
+                config = json.load(geometry_file)
+            for name in lengths:
+                if name in config:
+                    lengths[name] = float(config[name])
+        except Exception:
+            pass
+        self._link_lengths_mm = lengths
+        return lengths
+
+    @staticmethod
+    def _estimate_wrist_roll(hsv, wrist_roll, gripper_tip, distal_unit) -> float:
+        """Estimate axial roll from the black gripper-servo casing's lateral silhouette."""
+        if hsv is None or np is None:
+            return 0.0
+        try:
+            height, width = hsv.shape[:2]
+            start = np.asarray(wrist_roll, dtype=float)
+            end = np.asarray(gripper_tip, dtype=float)
+            segment = end - start
+            length = float(np.linalg.norm(segment))
+            if length <= 0.0:
+                return 0.0
+            unit = np.asarray(distal_unit, dtype=float)
+            normal = np.asarray((-unit[1], unit[0]), dtype=float)
+            radius = 45.0
+            x0 = max(0, int(math.floor(min(start[0], end[0]) - radius)))
+            x1 = min(width, int(math.ceil(max(start[0], end[0]) + radius)) + 1)
+            y0 = max(0, int(math.floor(min(start[1], end[1]) - radius)))
+            y1 = min(height, int(math.ceil(max(start[1], end[1]) + radius)) + 1)
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            offsets = np.stack((xx - start[0], yy - start[1]), axis=-1)
+            along = offsets[..., 0] * unit[0] + offsets[..., 1] * unit[1]
+            perpendicular = offsets[..., 0] * normal[0] + offsets[..., 1] * normal[1]
+            roi_hsv = hsv[y0:y1, x0:x1]
+            dark = (roi_hsv[..., 2] < 70) & (roi_hsv[..., 1] < 140)
+            servo = dark & (along >= 0.0) & (along <= length) & (np.abs(perpendicular) <= radius)
+            positive = int(np.count_nonzero(servo & (perpendicular > 0.0)))
+            negative = int(np.count_nonzero(servo & (perpendicular < 0.0)))
+            eta = (positive - negative) / (positive + negative + 1.0)
+            return round(90.0 * max(-1.0, min(1.0, eta)), 1) % 360.0
+        except Exception:
+            return 0.0
 
     # ---------- helpers ----------
     def _load_joint_limits(self) -> dict:
@@ -548,43 +602,61 @@ class ArmVisionAnalyzer:
             )
             base = (shoulder[0], float(base_y))
 
-            # A separate component beyond the wrist-roll joint is the blue
-            # gripper; otherwise extrapolate along the forearm axis.
-            vx = wrist_roll[0] - ax
-            vy = wrist_roll[1] - ay
-            length = math.hypot(vx, vy)
-            if length <= 0.0:
+            # The distal mask centroid indicates the wrist-to-gripper direction,
+            # but it is not the wrist-roll joint: Motor 2 sits inside the U-fork,
+            # before the brass standoffs and Motor 1's servo casing.
+            distal_target = np.asarray(wrist_roll, dtype=float)
+            raw_wrist_pitch = np.asarray(wrist_pitch, dtype=float)
+            distal_vector = distal_target - raw_wrist_pitch
+            distal_length = float(np.linalg.norm(distal_vector))
+            if distal_length <= 0.0:
                 return None
-            ux, uy = vx / length, vy / length
-            labels_count, labels, stats, centers = cv2.connectedComponentsWithStats(
-                sel_mask, connectivity=8
+            ux, uy = (distal_vector / distal_length).tolist()
+
+            # Calibrate pixels/mm from both visible primary links, then restore
+            # their known lengths along the detected link directions. This keeps
+            # the whole skeleton on one physical scale even across mask gaps.
+            lengths_mm = self._load_link_lengths()
+            shoulder_point = np.asarray(shoulder, dtype=float)
+            elbow_point = np.asarray(apex, dtype=float)
+            wrist_point = np.asarray(wrist_pitch, dtype=float)
+            d2_px = float(np.linalg.norm(elbow_point - shoulder_point))
+            d3_px = float(np.linalg.norm(wrist_point - elbow_point))
+            if d2_px <= 0.0 or d3_px <= 0.0:
+                return None
+            scale = 0.5 * (d2_px / lengths_mm["L2"] + d3_px / lengths_mm["L3"])
+
+            def along_link(origin, target, distance):
+                vector = np.asarray(target, dtype=float) - np.asarray(origin, dtype=float)
+                norm = float(np.linalg.norm(vector))
+                if norm <= 0.0:
+                    return np.asarray(origin, dtype=float)
+                return np.asarray(origin, dtype=float) + vector * (distance / norm)
+
+            shoulder = tuple(shoulder_point.tolist())
+            elbow = along_link(shoulder, elbow_point, lengths_mm["L2"] * scale).tolist()
+            wrist_pitch = along_link(elbow, wrist_point, lengths_mm["L3"] * scale).tolist()
+
+            base_direction = np.asarray((0.0, 1.0), dtype=float)
+            detected_base_direction = np.asarray(base, dtype=float) - shoulder_point
+            base_direction_length = float(np.linalg.norm(detected_base_direction))
+            if base_direction_length > 0.0:
+                base_direction = detected_base_direction / base_direction_length
+            base_point = shoulder_point + base_direction * (lengths_mm["L1"] * scale)
+            base = (
+                min(max(float(base_point[0]), 8.0), frame_w - 8.0),
+                min(max(float(base_point[1]), 8.0), frame_h - 8.0),
             )
-            roll_x = min(max(int(round(wrist_roll[0])), 0), frame_w - 1)
-            roll_y = min(max(int(round(wrist_roll[1])), 0), frame_h - 1)
-            roll_label = int(labels[roll_y, roll_x])
-            distal_candidates = []
-            for label in range(1, labels_count):
-                if label == roll_label or int(stats[label, cv2.CC_STAT_AREA]) < 20:
-                    continue
-                cx, cy = (float(centers[label, 0]), float(centers[label, 1]))
-                dx, dy = cx - wrist_roll[0], cy - wrist_roll[1]
-                along = dx * ux + dy * uy
-                across = abs(dx * uy - dy * ux)
-                if along > 10.0 and across <= max(35.0, 0.25 * along):
-                    distal_candidates.append((along, (cx, cy)))
-            if distal_candidates:
-                tip = max(distal_candidates, key=lambda candidate: candidate[0])[1]
-            else:
-                extension = 0.42 * length
-                tip = (
-                    wrist_roll[0] + extension * ux,
-                    wrist_roll[1] + extension * uy,
-                )
+
+            wrist_roll_point = np.asarray(wrist_pitch, dtype=float) + np.asarray((ux, uy)) * (lengths_mm["L4"] * scale)
+            wrist_roll = (float(wrist_roll_point[0]), float(wrist_roll_point[1]))
+            gripper_distance = (lengths_mm["d5"] + lengths_mm["L6_finger"]) * scale
+            tip = wrist_roll_point + np.asarray((ux, uy)) * gripper_distance
             tip = (
-                min(max(float(tip[0]), 0.0), frame_w - 1.0),
-                min(max(float(tip[1]), 0.0), frame_h - 1.0),
+                min(max(float(tip[0]), 8.0), frame_w - 8.0),
+                min(max(float(tip[1]), 8.0), frame_h - 8.0),
             )
-            elbow = apex
+            theta5 = self._estimate_wrist_roll(hsv, wrist_roll, tip, (ux, uy))
         else:
             # Eight continuous horizontal-band centroids form a stable medial
             # polyline for straight and single-bend silhouettes.
@@ -626,6 +698,8 @@ class ArmVisionAnalyzer:
         thetas = self._derive_angles(kp)
         if thetas is None:
             return None
+        if is_arch:
+            thetas[4] = theta5
         thetas = self._clamp(thetas)
         return thetas, kp, blue_area, 5
 

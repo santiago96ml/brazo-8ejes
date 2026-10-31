@@ -332,7 +332,13 @@ class VirtualOpticalEncoder:
             if self._theta_filt_prev is None:
                 thetas_filt = list(thetas_med)
             else:
-                thetas_filt = [alpha_g * thetas_med[i] + (1.0 - alpha_g) * self._theta_filt_prev[i] for i in range(6)]
+                alphas = [alpha_g] * 6
+                alphas[3] = 0.05
+                alphas[4] = 0.01
+                thetas_filt = [
+                    alphas[i] * thetas_med[i] + (1.0 - alphas[i]) * self._theta_filt_prev[i]
+                    for i in range(6)
+                ]
         else:
             alpha = self.filter_alpha  # 0.72 for ArUco
             if self._theta_filt_prev is None:
@@ -489,6 +495,15 @@ class VirtualOpticalEncoder:
         start_time = time.time()
         for i, frame in enumerate(warmup_frames):
             self.read_positions(frame, timestamp_s=start_time + i * 0.033)
+        # Warm-up is for camera/analyzer settling, not for carrying startup
+        # transients into the measured audit window.
+        self._theta_filt = [0.0] * 6
+        self._prev_thetas = None
+        self._omega_vis = [0.0] * 6
+        self._last_t = None
+        self._initialized = False
+        self._thetas_raw_history = []
+        self._theta_filt_prev = None
         results = []
         for i, f in enumerate(evaluation_frames):
             r = self.read_positions(f, timestamp_s=start_time + (len(warmup_frames) + i) * 0.033)
