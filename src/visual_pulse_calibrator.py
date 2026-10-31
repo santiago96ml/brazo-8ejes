@@ -75,7 +75,8 @@ class VisualPulseCalibrator:
                  candidates: tuple = (304, 305, 306, 307, 308, 309, 310, 311),
                  settle_s: float = 0.4, burst_ms: int = 200,
                  delta_pwm: int = 40, stop_epsilon_px_s: float = 0.35,
-                 max_runtime_s: float = 120.0, dry_run: bool = False):
+                 max_runtime_s: float = 120.0, dry_run: bool = False,
+                 preload_default: bool = True):
         self.camera = camera
         self.analyzer = analyzer
         self.controller = controller
@@ -89,6 +90,7 @@ class VisualPulseCalibrator:
         self.stop_epsilon_px_s = float(stop_epsilon_px_s)
         self.max_runtime_s = float(max_runtime_s)
         self.dry_run = bool(dry_run)
+        self.preload_default = bool(preload_default)
         self._profile: Dict[str, Any] = {"generated_at": "", "camera_index": 0, "motors": {}, "shoulder_coupling": 1}
         self._last_tracked: Dict[int, Tuple[float, float]] = {}
 
@@ -264,37 +266,33 @@ class VisualPulseCalibrator:
                 cartesian = {"x": float(fk["x_mm"]), "y": float(fk["y_mm"]), "z": float(fk["z_mm"])}
             except Exception:
                 pass
-        # send "Z:<m1>,<m2>,<m3>,<m4>,<m5>,<m7>" silent preload
-        if self.state is not None and hasattr(self.state, "build_preload_command"):
-            try:
-                # build motors from thetas if possible
-                if RobotArm6DOF is not None:
-                    try:
-                        arm = RobotArm6DOF()
-                        motors = arm.kinematic_to_servo_angles(thetas)
-                        zcmd = self.state.build_preload_command(motors)
-                    except Exception:
-                        zcmd = None
-                else:
-                    zcmd = None
-                if zcmd is None:
-                    # fallback manual
-                    zcmd = self.state.build_preload_command({1: 50, 2: 0, 3: 90, 4: 90, 5: 90, 7: 0})
-                self._send(zcmd)
-            except Exception:
-                # best effort
-                try:
-                    self._send("Z:50,0,90,90,90,0")
-                except Exception:
-                    pass
+        # Silent preload is ONLY safe with a trustworthy pose. A geometric-guess
+        # preload would snap several joints to wrong pulses and stall them against
+        # their mechanical stops, so it is skipped unless vision is ArUco-based.
+        preload_done = False
+        skip_reason = None
+        if not self.preload_default:
+            skip_reason = "preload disabled"
+        elif source != "aruco":
+            skip_reason = "vision source %s is not metrically trustworthy" % source
         else:
-            try:
-                self._send("Z:50,0,90,90,90,0")
-            except Exception:
-                pass
+            if self.state is not None and hasattr(self.state, "build_preload_command") and RobotArm6DOF is not None:
+                try:
+                    arm = RobotArm6DOF()
+                    motors = arm.kinematic_to_servo_angles(thetas)
+                    zcmd = self.state.build_preload_command(motors)
+                    if zcmd:
+                        self._send(zcmd)
+                        preload_done = True
+                except Exception as exc:
+                    skip_reason = "preload failed: %s" % exc
+            else:
+                skip_reason = "state manager or kinematics unavailable"
         # then "R" to enable
         self._send("R")
-        return {"oe": "LOW", "source": source, "thetas_deg": list(thetas), "cartesian_mm": cartesian, "preloaded": True}
+        return {"oe": "LOW", "source": source, "thetas_deg": list(thetas),
+                "cartesian_mm": cartesian, "preloaded": preload_done,
+                "preload_skipped": skip_reason}
 
     def _get_frame_and_analysis(self):
         frame = None
