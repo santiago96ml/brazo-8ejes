@@ -375,8 +375,23 @@ class VirtualOpticalEncoder:
     def audit_pre_power(self, frames_iterable_or_camera, num_frames: int = 30, max_variance_deg: float = 0.15, require_all_aruco: bool = False) -> dict:
         frames = []
         try:
-            # If it's a camera/callable style, try to grab
-            if hasattr(frames_iterable_or_camera, "read"):
+            # FastUSBCamera publishes one latest frame repeatedly until its
+            # reader thread replaces it. Count timestamps, not polls/reads.
+            if hasattr(frames_iterable_or_camera, "get_latest_frame"):
+                camera = frames_iterable_or_camera
+                last_ts_ns = None
+                for _ in range(num_frames):
+                    deadline = time.monotonic() + 0.5
+                    while time.monotonic() < deadline:
+                        frame, ts_ns, _fps = camera.get_latest_frame()
+                        if frame is not None and ts_ns != last_ts_ns:
+                            frames.append(frame)
+                            last_ts_ns = ts_ns
+                            break
+                        time.sleep(0.005)
+                    else:
+                        break
+            elif hasattr(frames_iterable_or_camera, "read"):
                 cap = frames_iterable_or_camera
                 for _ in range(num_frames):
                     ret, frame = cap.read()
@@ -400,7 +415,7 @@ class VirtualOpticalEncoder:
                     if f is not None:
                         frames.append(f)
         except Exception:
-            frames = []
+            pass
 
         if not frames:
             return {
@@ -411,8 +426,8 @@ class VirtualOpticalEncoder:
                 "visible_marker_ids": [],
                 "resting_thetas_deg": [0.0] * 6,
                 "resting_motors_deg": {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0},
-                "variances_deg2": [float("inf")] * 6,
-                "max_variance_deg2": float("inf"),
+                "variances_deg2": [999.0] * 6,
+                "max_variance_deg2": 999.0,
                 "max_Limit_deg2": float(max_variance_deg),
                 "reason": "no_frames_captured",
             }
@@ -448,14 +463,17 @@ class VirtualOpticalEncoder:
             arr = thetas_series[i]
             if not arr:
                 means.append(0.0)
-                variances.append(float("inf"))
+                variances.append(999.0)
                 continue
             m = sum(arr) / len(arr)
             var = sum((x - m) ** 2 for x in arr) / len(arr)
             means.append(m)
             variances.append(var)
 
-        max_var = max(variances) if variances else float("inf")
+        max_var = max(variances) if variances else 999.0
+        if not math.isfinite(max_var):
+            max_var = 999.0
+        variances = [value if math.isfinite(value) else 999.0 for value in variances]
         passed = max_var < float(max_variance_deg)
 
         if require_all_aruco:

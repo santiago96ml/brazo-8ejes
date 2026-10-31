@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -31,6 +32,89 @@ from src.fast_camera import FastUSBCamera
 from src.virtual_optical_encoder import VirtualOpticalEncoder
 from src.kinematics_6dof import RobotArm6DOF
 from src.pid_pwm_controller import SafeVisualHomingMachine
+
+
+def _json_safe(value):
+    """Replace non-finite numbers before emitting RFC-8259 JSON."""
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return 999.0
+    return value
+
+
+def _write_annotated_snapshot(frame, path, encoder, optical_audit, camera_status, joint_report):
+    """Write a diagnostic image, preserving the raw frame if annotations fail."""
+    if frame is None or cv2 is None:
+        return
+    annotated = frame.copy()
+    try:
+        markers = encoder._detect_aruco(annotated)
+        for marker_id, marker in markers.items():
+            corners = marker.get("corners")
+            if corners is None:
+                continue
+            corners = corners.astype(int)
+            cv2.polylines(annotated, [corners.reshape(-1, 1, 2)], True, (0, 255, 0), 2)
+            cv2.putText(
+                annotated, f"ID {marker_id}", (int(corners[0][0]), int(corners[0][1]) - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1,
+            )
+            top_left = marker.get("tl")
+            top_vec = marker.get("top_vec")
+            if top_left is not None and top_vec is not None:
+                start = (int(top_left[0]), int(top_left[1]))
+                end = (int(top_left[0] + top_vec[0]), int(top_left[1] + top_vec[1]))
+                cv2.arrowedLine(annotated, start, end, (0, 0, 255), 2)
+
+        analyzer = getattr(encoder, "fallback_analyzer", None)
+        if analyzer is not None:
+            try:
+                geometry = analyzer.analyze(frame)
+                keypoints = geometry.get("keypoints_px") or {}
+                for start_name, end_name in geometry.get("skeleton", []):
+                    if start_name not in keypoints or end_name not in keypoints:
+                        continue
+                    start = tuple(int(v) for v in keypoints[start_name][:2])
+                    end = tuple(int(v) for v in keypoints[end_name][:2])
+                    cv2.line(annotated, start, end, (255, 0, 255), 3)
+                    cv2.circle(annotated, start, 5, (255, 255, 0), -1)
+                    cv2.circle(annotated, end, 5, (255, 255, 0), -1)
+            except Exception:
+                pass
+
+        status_text = (
+            f"PHASE 1 OPTICAL AUDIT: {'PASSED' if optical_audit.get('passed') else 'HOLD_HIGH'} "
+            f"| var={optical_audit.get('max_variance_deg2', 999.0):.4f} "
+            f"| FPS={camera_status.get('fps', 0.0):.1f} | OE = HIGH [SERVOS OFF]"
+        )
+        cv2.putText(
+            annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            (0, 255, 0) if optical_audit.get("passed") else (0, 0, 255), 2,
+        )
+        motor_values = [
+            joint_report.get("motor1_pinza", {}).get("motor_deg", 0.0),
+            joint_report.get("motor2_giro_pinza", {}).get("motor_deg", 0.0),
+            joint_report.get("motor3_inclina_pinza", {}).get("motor_deg", 0.0),
+            joint_report.get("motor4_codo", {}).get("motor_deg", 0.0),
+            joint_report.get("motors5_6_hombro_doble", {}).get("motor5_deg", 0.0),
+            joint_report.get("motors5_6_hombro_doble", {}).get("motor6_deg", 0.0),
+            joint_report.get("motor7_base", {}).get("motor_deg", 0.0),
+        ]
+        for index, angle in enumerate(motor_values, start=1):
+            cv2.putText(
+                annotated, f"Motor {index}: {angle:.1f} deg", (10, 60 + (index - 1) * 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1,
+            )
+    except Exception:
+        # A diagnostic drawing failure must not prevent saving the captured image.
+        pass
+    try:
+        cv2.imwrite(path, annotated)
+    except Exception:
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,26 +150,24 @@ def main(argv: list[str] | None = None) -> int:
     optical_audit = {}
     joint_positions_report = {}
     tcp_cartesian_mm = {"x": 0.0, "y": 0.0, "z": 0.0}
-    annotated_frame = None
+    frame = None
 
     try:
         with FastUSBCamera(index=args.camera, width=1280, height=720, fps=30) as cam:
-            # warm up
-            time.sleep(0.5)
+            # MSMF may suppress its first warm-up frames; wait for publication.
+            first_frame_deadline = time.monotonic() + 5.0
+            frame = None
+            while time.monotonic() < first_frame_deadline:
+                frame, _ts_ns, _fps_meas = cam.get_latest_frame()
+                if frame is not None:
+                    break
+                time.sleep(0.005)
             stats = cam.stats()
             camera_status = {
                 "fps": float(stats.get("fps", 0.0)),
                 "resolution": [int(stats.get("width", 1280)), int(stats.get("height", 720))],
                 "backend": stats.get("fourcc", "unknown"),
             }
-
-            # Get latest frame for snapshot/calibration
-            frame, ts_ns, fps_meas = cam.get_latest_frame()
-            if frame is None:
-                # try read
-                ret, frame = cam.read()
-                if not ret:
-                    frame = None
 
             if args.calibrate_zero and frame is not None:
                 try:
@@ -105,8 +187,8 @@ def main(argv: list[str] | None = None) -> int:
                     "visible_marker_ids": [],
                     "resting_thetas_deg": [0.0] * 6,
                     "resting_motors_deg": {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0},
-                    "variances_deg2": [float("inf")] * 6,
-                    "max_variance_deg2": float("inf"),
+                    "variances_deg2": [999.0] * 6,
+                    "max_variance_deg2": 999.0,
                     "reason": f"error:{e}",
                 }
 
@@ -115,13 +197,11 @@ def main(argv: list[str] | None = None) -> int:
                 "frames_evaluated": int(audit_res.get("frames_evaluated", 0)),
                 "mode_used": audit_res.get("mode_used", "none"),
                 "visible_marker_ids": audit_res.get("visible_marker_ids", []),
-                "max_variance_deg2": float(audit_res.get("max_variance_deg2", float("inf"))),
+                "max_variance_deg2": float(audit_res.get("max_variance_deg2", 999.0)),
                 "oe_recommendation": audit_res.get("oe_recommendation", "HOLD_HIGH"),
             }
 
             # Read positions from latest frame
-            if frame is None:
-                ret, frame = cam.read()
             pos_res = encoder.read_positions(frame) if frame is not None else encoder._empty_result(0.0)
 
             # Build joint positions report
@@ -229,69 +309,6 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 tcp_cartesian_mm = {"x": 0.0, "y": 0.0, "z": 0.0}
 
-            # Save annotated snapshot
-            annotated_frame = frame.copy() if frame is not None else None
-            if annotated_frame is not None and cv2 is not None:
-                try:
-                    markers = encoder._detect_aruco(annotated_frame)
-                    for mid, minfo in markers.items():
-                        corners = minfo.get("corners")
-                        if corners is not None:
-                            c = corners.astype(int)
-                            cv2.polylines(annotated_frame, [c.reshape(-1, 1, 2)], True, (0, 255, 0), 2)
-                            cv2.putText(
-                                annotated_frame,
-                                f"ID {mid}",
-                                (int(c[0][0]), int(c[0][1]) - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5,
-                                (0, 255, 0),
-                                1,
-                            )
-                            # draw top edge direction
-                            tl = minfo.get("tl")
-                            vtop = minfo.get("top_vec")
-                            if tl is not None and vtop is not None:
-                                p1 = (int(tl[0]), int(tl[1]))
-                                p2 = (int(tl[0] + vtop[0]), int(tl[1] + vtop[1]))
-                                cv2.arrowedLine(annotated_frame, p1, p2, (0, 0, 255), 2)
-                    # status banner
-                    status_text = f"PHASE 1 OPTICAL AUDIT: {'PASSED' if optical_audit['passed'] else 'HOLD_HIGH'} | var={optical_audit['max_variance_deg2']:.4f} | FPS={camera_status['fps']:.1f} | OE = HIGH [SERVOS OFF]"
-                    cv2.putText(
-                        annotated_frame,
-                        status_text,
-                        (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 0, 255) if not optical_audit["passed"] else (0, 255, 0),
-                        2,
-                    )
-                    # motor readouts
-                    y = 60
-                    lines = [
-                        f"Motor 1 (PINZA): {joint_positions_report['motor1_pinza']['motor_deg']:.1f}°",
-                        f"Motor 2 (GIRO_PINZA): {joint_positions_report['motor2_giro_pinza']['motor_deg']:.1f}°",
-                        f"Motor 3 (INCLINA_PINZA): {joint_positions_report['motor3_inclina_pinza']['motor_deg']:.1f}°",
-                        f"Motor 4 (CODO): {joint_positions_report['motor4_codo']['motor_deg']:.1f}°",
-                        f"Motors 5&6 (HOMBRO_DOBLE): {joint_positions_report['motors5_6_hombro_doble']['motor5_deg']:.1f}°/{joint_positions_report['motors5_6_hombro_doble']['motor6_deg']:.1f}°",
-                        f"Motor 7 (BASE): {joint_positions_report['motor7_base']['motor_deg']:.1f}°",
-                    ]
-                    for l in lines:
-                        cv2.putText(annotated_frame, l, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                        y += 20
-                    cv2.imwrite(args.snapshot, annotated_frame)
-                except Exception:
-                    try:
-                        if annotated_frame is not None:
-                            cv2.imwrite(args.snapshot, annotated_frame)
-                    except Exception:
-                        pass
-            elif frame is not None and cv2 is not None:
-                try:
-                    cv2.imwrite(args.snapshot, frame)
-                except Exception:
-                    pass
-
     except Exception as e:
         # Still produce a report even if camera fails
         optical_audit = {
@@ -299,19 +316,24 @@ def main(argv: list[str] | None = None) -> int:
             "frames_evaluated": 0,
             "mode_used": "none",
             "visible_marker_ids": [],
-            "max_variance_deg2": float("inf"),
+            "max_variance_deg2": 999.0,
             "oe_recommendation": "HOLD_HIGH",
         }
         joint_positions_report = {
-            "motor1_pinza": {"motor_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": float("inf"), "u_stop_preload": 307},
-            "motor2_giro_pinza": {"motor_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": float("inf"), "u_stop_preload": 307},
-            "motor3_inclina_pinza": {"motor_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": float("inf"), "u_stop_preload": 307},
-            "motor4_codo": {"motor_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": float("inf"), "u_stop_preload": 307},
-            "motors5_6_hombro_doble": {"motor5_deg": 0.0, "motor6_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": float("inf"), "u_stop_preload": 307},
-            "motor7_base": {"motor_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": float("inf"), "u_stop_preload": 307},
+            "motor1_pinza": {"motor_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": 999.0, "u_stop_preload": 307},
+            "motor2_giro_pinza": {"motor_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": 999.0, "u_stop_preload": 307},
+            "motor3_inclina_pinza": {"motor_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": 999.0, "u_stop_preload": 307},
+            "motor4_codo": {"motor_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": 999.0, "u_stop_preload": 307},
+            "motors5_6_hombro_doble": {"motor5_deg": 0.0, "motor6_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": 999.0, "u_stop_preload": 307},
+            "motor7_base": {"motor_deg": 0.0, "theta_deg": 0.0, "omega_dps": 0.0, "variance_deg2": 999.0, "u_stop_preload": 307},
         }
         tcp_cartesian_mm = {"x": 0.0, "y": 0.0, "z": 0.0}
         camera_status = {"fps": 0.0, "resolution": None, "backend": f"error:{e}"}
+
+    if frame is not None:
+        _write_annotated_snapshot(
+            frame, args.snapshot, encoder, optical_audit, camera_status, joint_positions_report
+        )
 
     report = {
         "camera_status": camera_status,
@@ -331,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
         "Motor 7 Base",
     ]
 
-    print(json.dumps(report, indent=2))
+    print(json.dumps(_json_safe(report), indent=2, allow_nan=False))
     return 0
 
 
