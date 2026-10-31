@@ -93,7 +93,10 @@ class TestVisualPulseCalibrator(unittest.TestCase):
         ana = _FakeAnalyzer()
         ctrl = type("C", (), {})()
         ctrl.transport = _FakeTransport()
-        ctrl.state = type("S", (), {"update_from_thetas": lambda self, t: None})()
+        ctrl.state = type("S", (), {
+            "update_from_thetas": lambda self, t: None,
+            "build_preload_command": lambda self, motors: "Z:50,0,90,90,90,0",
+        })()
         cal = VisualPulseCalibrator(camera=cam, analyzer=ana, controller=ctrl, dry_run=False)
         res = cal.zero_sync()
         sent = ctrl.transport.sent
