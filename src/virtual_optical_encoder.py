@@ -73,6 +73,8 @@ class VirtualOpticalEncoder:
         self._omega_vis = [0.0] * 6
         self._last_t = None
         self._initialized = False
+        self._thetas_raw_history = []
+        self._theta_filt_prev = None
 
         # ArUco setup
         self._aruco_dict = None
@@ -305,27 +307,54 @@ class VirtualOpticalEncoder:
                 thetas_raw = [0.0] * 6
             grip_opening_mm = max(0.0, min(80.0, thetas_raw[5]))
 
-        # Filtering: the first valid observation establishes the resting pose
-        # directly, avoiding an artificial ramp from the constructor's zeros.
+        # Filtering
         now = timestamp_s
-        if self._prev_thetas is None:
-            thetas_filt = list(thetas_raw)
-            self._prev_thetas = list(thetas_filt)
-            self._theta_filt = list(thetas_filt)
+        # Push raw to history for median-of-5 in geometric fallback
+        self._thetas_raw_history.append([float(v) for v in thetas_raw])
+        if len(self._thetas_raw_history) > 5:
+            self._thetas_raw_history = self._thetas_raw_history[-5:]
+
+        if mode_used == "geometric_fallback":
+            # median-of-5 over raw thetas
+            thetas_med = [0.0] * 6
+            for i in range(6):
+                vals = [h[i] for h in self._thetas_raw_history if len(h) > i]
+                if vals:
+                    vs = sorted(vals)
+                    m = len(vs) // 2
+                    if len(vs) % 2 == 1:
+                        thetas_med[i] = vs[m]
+                    else:
+                        thetas_med[i] = (vs[m - 1] + vs[m]) / 2.0
+                else:
+                    thetas_med[i] = thetas_raw[i]
+            alpha_g = 0.25
+            if self._theta_filt_prev is None:
+                thetas_filt = list(thetas_med)
+            else:
+                thetas_filt = [alpha_g * thetas_med[i] + (1.0 - alpha_g) * self._theta_filt_prev[i] for i in range(6)]
+        else:
+            alpha = self.filter_alpha  # 0.72 for ArUco
+            if self._theta_filt_prev is None:
+                thetas_filt = list(thetas_raw)
+            else:
+                thetas_filt = [alpha * thetas_raw[i] + (1.0 - alpha) * self._theta_filt_prev[i] for i in range(6)]
+
+        # omega with deadband
+        dt = max(0.01, min(0.5, float(now) - float(self._last_t) if self._last_t is not None else 0.033))
+        if self._theta_filt_prev is None:
             self._omega_vis = [0.0] * 6
         else:
-            dt = max(0.01, min(0.5, float(now) - float(self._last_t)))
-            alpha = self.filter_alpha
-            previous = list(self._prev_thetas)
-            thetas_filt = [
-                alpha * thetas_raw[i] + (1.0 - alpha) * previous[i]
-                for i in range(6)
-            ]
             for i in range(6):
-                measured_omega = (thetas_filt[i] - previous[i]) / dt
-                self._omega_vis[i] = 0.5 * self._omega_vis[i] + 0.5 * measured_omega
-            self._prev_thetas = list(thetas_filt)
-            self._theta_filt = list(thetas_filt)
+                delta_deg = thetas_filt[i] - self._theta_filt_prev[i]
+                if abs(delta_deg) < 0.25:
+                    omega = 0.0
+                else:
+                    omega = delta_deg / dt
+                self._omega_vis[i] = omega
+        self._prev_thetas = list(thetas_filt)
+        self._theta_filt = list(thetas_filt)
+        self._theta_filt_prev = list(thetas_filt)
         self._last_t = now
         self._initialized = True
 
@@ -388,6 +417,8 @@ class VirtualOpticalEncoder:
         self._omega_vis = [0.0] * 6
         self._last_t = None
         self._initialized = False
+        self._thetas_raw_history = []
+        self._theta_filt_prev = None
         requested_frames = max(0, int(num_frames))
         warmup_count = 10
         capture_count = requested_frames + warmup_count
@@ -451,8 +482,6 @@ class VirtualOpticalEncoder:
             }
 
         # Warm up the temporal filter before accumulating the requested sample.
-        # Finite replay inputs may expose only the evaluation count; in that
-        # case reuse those frames for evaluation after the warm-up pass.
         warmup_frames = frames[:warmup_count]
         evaluation_frames = frames[warmup_count:warmup_count + requested_frames]
         if len(frames) < capture_count:
