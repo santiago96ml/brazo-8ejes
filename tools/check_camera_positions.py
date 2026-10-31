@@ -79,9 +79,25 @@ def _write_annotated_snapshot(frame, path, encoder, optical_audit, camera_status
                         continue
                     start = tuple(int(v) for v in keypoints[start_name][:2])
                     end = tuple(int(v) for v in keypoints[end_name][:2])
-                    cv2.line(annotated, start, end, (255, 0, 255), 3)
-                    cv2.circle(annotated, start, 5, (255, 255, 0), -1)
-                    cv2.circle(annotated, end, 5, (255, 255, 0), -1)
+                    cv2.line(annotated, start, end, (0, 255, 255), 6)
+                labels = {
+                    "base": "BASE",
+                    "shoulder": "SHOULDER",
+                    "elbow": "ELBOW",
+                    "wrist_pitch": "WRIST_P",
+                    "wrist_roll": "WRIST_R",
+                    "gripper_tip": "GRIPPER",
+                }
+                for index, (name, label) in enumerate(labels.items()):
+                    if name not in keypoints:
+                        continue
+                    point = tuple(int(v) for v in keypoints[name][:2])
+                    color = (0, 0, 255) if index % 2 == 0 else (255, 255, 0)
+                    cv2.circle(annotated, point, 8, color, -1)
+                    cv2.putText(
+                        annotated, label, (point[0] + 9, point[1] - 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
+                    )
             except Exception:
                 pass
 

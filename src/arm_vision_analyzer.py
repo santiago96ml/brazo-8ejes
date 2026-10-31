@@ -10,6 +10,7 @@ import math
 import os
 import sys
 import time
+from collections import deque
 from typing import Any, Optional
 
 # Performance env (S10) - best effort
@@ -150,8 +151,8 @@ class ArmVisionAnalyzer:
         aruco_dict: int = (cv2.aruco.DICT_4X4_50 if cv2 is not None else 0),
         kinematics: Any = None,
         neural: KeypointNeuralPredictor = None,
-        hsv_lower: tuple = (85, 60, 40),
-        hsv_upper: tuple = (135, 255, 255),
+        hsv_lower: tuple = (85, 35, 25),
+        hsv_upper: tuple = (138, 255, 255),
         blue_ratio: float = 1.25,
         use_clahe: bool = True,
         clahe_clip: float = 2.0,
@@ -250,11 +251,12 @@ class ArmVisionAnalyzer:
         bi = b.astype(np.int16)
         gi = g.astype(np.int16)
         ri = r.astype(np.int16)
-        ratio_mask = ((bi > (self.blue_ratio * ri)) & (bi > (1.15 * gi))).astype(np.uint8) * 255
+        ratio_mask = ((bi - ri > 15) & (bi > gi)).astype(np.uint8) * 255
         mask = cv2.bitwise_and(mask_hsv, ratio_mask)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
         mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
         return mask, hsv
 
@@ -373,92 +375,91 @@ class ArmVisionAnalyzer:
             return None
         frame_h, frame_w = frame.shape[:2]
         frame_area = float(frame_h * frame_w)
-        selected = None
-        best_score = -1.0
-        for cand in contours:
-            area = float(cv2.contourArea(cand))
-            if area < 0.002 * frame_area or area > 0.35 * frame_area:
-                continue
-            bx, by, bw, bh = cv2.boundingRect(cand)
-            if bx + bw >= frame_w - 3 or by + bh >= frame_h - 3:
-                continue  # clipped by the frame: laptop/screen edge, not the arm
-            if bh < 1.2 * max(bw, 1):
-                continue  # the arm is a tall structure
-            hull = cv2.convexHull(cand)
-            hull_area = float(cv2.contourArea(hull))
-            solidity = area / hull_area if hull_area > 0 else 1.0
-            if solidity > 0.92:
-                continue  # filled rectangle, not an articulated arm
-            score = bh * area
-            if score > best_score:
-                best_score = score
-                selected = cand
-        c = selected if selected is not None else max(contours, key=cv2.contourArea)
-        if cv2.contourArea(c) < 50:
+        candidates = [c for c in contours if cv2.contourArea(c) >= 0.002 * frame_area]
+        if not candidates:
             return None
-        # Work only on the selected blob so background blue does not drag the skeleton.
+        # Keep all substantial blue links; closing bridges servo gaps while the
+        # area threshold excludes reflections and isolated segmentation noise.
         sel_mask = np.zeros_like(mask)
-        cv2.drawContours(sel_mask, [c], -1, 255, -1)
+        cv2.drawContours(sel_mask, candidates, -1, 255, -1)
         ys, xs = np.where(sel_mask > 0)
-        if xs.size == 0:
+        if xs.size < 2:
             return None
-        y_min = int(ys.min())
-        y_max = int(ys.max())
-        band_h = (y_max - y_min + 1) / 8.0
-        points = []
-        for i in range(8):
-            lo = int(y_min + i * band_h)
-            hi = int(y_min + (i + 1) * band_h)
-            if hi <= lo:
-                hi = lo + 1
-            band = sel_mask[lo:hi, :]
-            M = cv2.moments(band)
-            if M["m00"] > 0:
-                cx = M["m10"] / M["m00"]
-                cy = M["m01"] / M["m00"] + lo
-                points.append((float(cx), float(cy)))
-        if len(points) < 2:
+
+        # Anchor the traversal at the bottom-most blue region (the base), then
+        # trace the longest in-mask geodesic to the distal gripper end.
+        roi = (xs >= int(frame_w * 0.35)) & (xs <= int(frame_w * 0.60))
+        roi &= (ys >= int(frame_h * 0.55)) & (ys <= int(frame_h * 0.85))
+        roi_xs, roi_ys = xs[roi], ys[roi]
+        if roi_xs.size and int(roi_xs.max() - roi_xs.min()) >= int(frame_w * 0.14):
+            # A broad lower-center blue region is the cylindrical base; its
+            # centroid is more stable than stray blue pixels at the frame edge.
+            base_x = float(roi_xs.mean())
+            base_y = float(roi_ys.mean())
+        else:
+            bottom_band = ys >= int(ys.max()) - max(12, int(frame_h * 0.04))
+            base_x = float(xs[bottom_band].mean())
+            base_y = float(ys[bottom_band].mean())
+        grid_w, grid_h = 160, 90
+        coarse = cv2.resize(sel_mask, (grid_w, grid_h), interpolation=cv2.INTER_NEAREST) > 0
+        grid_ys, grid_xs = np.where(coarse)
+        if grid_xs.size < 2:
             return None
-        # order from lowest (base) to highest
-        points.sort(key=lambda p: -p[1])
-        arr = np.array(points, dtype=np.float32).reshape(-1, 1, 2)
-        try:
-            arc = float(cv2.arcLength(arr, False))
-        except Exception:
-            arc = 0.0
-        eps = 0.02 * arc if arc > 0 else 1.0
-        try:
-            approx = cv2.approxPolyDP(arr, eps, False)
-            poly = [(float(p[0][0]), float(p[0][1])) for p in approx]
-        except Exception:
-            poly = []
-        if len(poly) < 2:
-            poly = points[:]
-        pts5 = self._resample(poly, 5)
-        # black box refinement
-        try:
-            black_mask = (hsv[:, :, 2] < 60).astype(np.uint8) * 255
-            contours_b, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            boxes = []
-            for bc in contours_b:
-                if cv2.contourArea(bc) > 200:
-                    M = cv2.moments(bc)
-                    if M["m00"] > 0:
-                        boxes.append((M["m10"] / M["m00"], M["m01"] / M["m00"]))
-            for i, pt in enumerate(pts5):
-                for bx, by in boxes:
-                    if (bx - pt[0]) ** 2 + (by - pt[1]) ** 2 <= 40 * 40:
-                        pts5[i] = (float(bx), float(by))
-        except Exception:
-            pass
-        base, shoulder, elbow, wrist, tip = pts5
-        wr = ((wrist[0] + tip[0]) / 2.0, (wrist[1] + tip[1]) / 2.0)
+        root_x = int(round(base_x * grid_w / frame_w))
+        root_y = int(round(base_y * grid_h / frame_h))
+        root_idx = int(np.argmin((grid_xs - root_x) ** 2 + (grid_ys - root_y) ** 2))
+        root = (int(grid_ys[root_idx]), int(grid_xs[root_idx]))
+        distances = np.full((grid_h, grid_w), -1, dtype=np.int32)
+        parents = np.full((grid_h, grid_w, 2), -1, dtype=np.int16)
+        distances[root] = 0
+        queue = deque([root])
+        while queue:
+            gy, gx = queue.popleft()
+            next_distance = distances[gy, gx] + 1
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = gy + dy, gx + dx
+                    if (dy == 0 and dx == 0) or ny < 0 or nx < 0 or ny >= grid_h or nx >= grid_w:
+                        continue
+                    if coarse[ny, nx] and distances[ny, nx] < 0:
+                        distances[ny, nx] = next_distance
+                        parents[ny, nx] = (gy, gx)
+                        queue.append((ny, nx))
+        reachable_y, reachable_x = np.where(distances >= 0)
+        if reachable_x.size < 2:
+            return None
+        farthest_idx = int(np.argmax(distances[reachable_y, reachable_x]))
+        target = (int(reachable_y[farthest_idx]), int(reachable_x[farthest_idx]))
+        grid_path = [target]
+        while grid_path[-1] != root:
+            py, px = parents[grid_path[-1]]
+            if py < 0 or px < 0:
+                return None
+            grid_path.append((int(py), int(px)))
+        grid_path.reverse()
+        scale_x = frame_w / grid_w
+        scale_y = frame_h / grid_h
+        path = [((gx + 0.5) * scale_x, (gy + 0.5) * scale_y) for gy, gx in grid_path]
+        if len(path) >= 5:
+            path_array = np.asarray(path, dtype=float)
+            padded = np.pad(path_array, ((2, 2), (0, 0)), mode="edge")
+            path = [tuple(np.mean(padded[i:i + 5], axis=0)) for i in range(len(path_array))]
+            path[0] = ((root[1] + 0.5) * scale_x, (root[0] + 0.5) * scale_y)
+            path[-1] = ((target[1] + 0.5) * scale_x, (target[0] + 0.5) * scale_y)
+        samples = self._resample(path, 101)
+        fractions = (0.0, 0.22, 0.50, 0.75, 0.88, 1.0)
+        sampled = [samples[int(round(fraction * 100))] for fraction in fractions]
+        # The elbow is the local upper apex for a folded posture. Restrict the
+        # search to the middle of the path so a straight arm remains unchanged.
+        apex_index = min(range(30, 71), key=lambda index: samples[index][1])
+        sampled[2] = samples[apex_index]
+        base, shoulder, elbow, wrist, wrist_roll, tip = sampled
         kp = {
             "base": (float(base[0]), float(base[1]), 0.8),
             "shoulder": (float(shoulder[0]), float(shoulder[1]), 0.8),
             "elbow": (float(elbow[0]), float(elbow[1]), 0.8),
             "wrist_pitch": (float(wrist[0]), float(wrist[1]), 0.7),
-            "wrist_roll": (float(wr[0]), float(wr[1]), 0.6),
+            "wrist_roll": (float(wrist_roll[0]), float(wrist_roll[1]), 0.6),
             "gripper_tip": (float(tip[0]), float(tip[1]), 0.7),
         }
         thetas = self._derive_angles(kp)

@@ -69,6 +69,7 @@ class VirtualOpticalEncoder:
 
         # Filter state
         self._theta_filt = [0.0] * 6
+        self._prev_thetas = None
         self._omega_vis = [0.0] * 6
         self._last_t = None
         self._initialized = False
@@ -304,19 +305,27 @@ class VirtualOpticalEncoder:
                 thetas_raw = [0.0] * 6
             grip_opening_mm = max(0.0, min(80.0, thetas_raw[5]))
 
-        # Filtering
+        # Filtering: the first valid observation establishes the resting pose
+        # directly, avoiding an artificial ramp from the constructor's zeros.
         now = timestamp_s
-        if not self._initialized or self._last_t is None:
-            dt = 1.0 / 30.0
+        if self._prev_thetas is None:
+            thetas_filt = list(thetas_raw)
+            self._prev_thetas = list(thetas_filt)
+            self._theta_filt = list(thetas_filt)
+            self._omega_vis = [0.0] * 6
         else:
-            dt = max(1e-3, float(now) - float(self._last_t))
-        alpha = self.filter_alpha
-        thetas_filt = [0.0] * 6
-        for i in range(6):
-            pred = self._theta_filt[i] + self._omega_vis[i] * dt
-            thetas_filt[i] = alpha * thetas_raw[i] + (1.0 - alpha) * pred
-            self._omega_vis[i] = (thetas_filt[i] - self._theta_filt[i]) / dt if dt > 0 else 0.0
-            self._theta_filt[i] = thetas_filt[i]
+            dt = max(0.01, min(0.5, float(now) - float(self._last_t)))
+            alpha = self.filter_alpha
+            previous = list(self._prev_thetas)
+            thetas_filt = [
+                alpha * thetas_raw[i] + (1.0 - alpha) * previous[i]
+                for i in range(6)
+            ]
+            for i in range(6):
+                measured_omega = (thetas_filt[i] - previous[i]) / dt
+                self._omega_vis[i] = 0.5 * self._omega_vis[i] + 0.5 * measured_omega
+            self._prev_thetas = list(thetas_filt)
+            self._theta_filt = list(thetas_filt)
         self._last_t = now
         self._initialized = True
 
@@ -373,6 +382,14 @@ class VirtualOpticalEncoder:
         }
 
     def audit_pre_power(self, frames_iterable_or_camera, num_frames: int = 30, max_variance_deg: float = 0.15, require_all_aruco: bool = False) -> dict:
+        # Start every audit from a clean filter state before consuming frames.
+        self._theta_filt = [0.0] * 6
+        self._prev_thetas = None
+        self._omega_vis = [0.0] * 6
+        self._last_t = None
+        self._initialized = False
+        requested_frames = max(0, int(num_frames))
+        capture_count = requested_frames + 3
         frames = []
         try:
             # FastUSBCamera publishes one latest frame repeatedly until its
@@ -380,7 +397,7 @@ class VirtualOpticalEncoder:
             if hasattr(frames_iterable_or_camera, "get_latest_frame"):
                 camera = frames_iterable_or_camera
                 last_ts_ns = None
-                for _ in range(num_frames):
+                for _ in range(capture_count):
                     deadline = time.monotonic() + 0.5
                     while time.monotonic() < deadline:
                         frame, ts_ns, _fps = camera.get_latest_frame()
@@ -393,13 +410,13 @@ class VirtualOpticalEncoder:
                         break
             elif hasattr(frames_iterable_or_camera, "read"):
                 cap = frames_iterable_or_camera
-                for _ in range(num_frames):
+                for _ in range(capture_count):
                     ret, frame = cap.read()
                     if not ret or frame is None:
                         break
                     frames.append(frame)
             elif callable(frames_iterable_or_camera):
-                for _ in range(num_frames):
+                for _ in range(capture_count):
                     f = frames_iterable_or_camera()
                     if f is None:
                         break
@@ -407,7 +424,7 @@ class VirtualOpticalEncoder:
             else:
                 # iterable
                 it = iter(frames_iterable_or_camera)
-                for _ in range(num_frames):
+                for _ in range(capture_count):
                     try:
                         f = next(it)
                     except StopIteration:
@@ -432,15 +449,19 @@ class VirtualOpticalEncoder:
                 "reason": "no_frames_captured",
             }
 
-        # Reset filter for audit
-        self._theta_filt = [0.0] * 6
-        self._omega_vis = [0.0] * 6
-        self._last_t = None
-        self._initialized = False
-
+        # Warm up with distinct leading frames, then evaluate the requested
+        # number of following frames. Finite test/replay inputs may only expose
+        # the requested count, in which case retain their full evaluation set.
+        warmup_frames = frames[:3]
+        evaluation_frames = frames[3:3 + requested_frames]
+        if len(frames) < capture_count:
+            evaluation_frames = frames[:requested_frames]
+        start_time = time.time()
+        for i, frame in enumerate(warmup_frames):
+            self.read_positions(frame, timestamp_s=start_time + i * 0.033)
         results = []
-        for i, f in enumerate(frames):
-            r = self.read_positions(f, timestamp_s=time.time() + i * 0.033)
+        for i, f in enumerate(evaluation_frames):
+            r = self.read_positions(f, timestamp_s=start_time + (len(warmup_frames) + i) * 0.033)
             results.append(r)
             if require_all_aruco:
                 vis = set(r.get("visible_marker_ids", []))

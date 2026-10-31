@@ -54,6 +54,22 @@ def test_45_degree_segment():
     assert abs(r["thetas_deg"][1] - 45.0) <= 12.0
 
 
+def test_geometric_traces_folded_arm_from_base_to_gripper():
+    img = np.zeros((720, 1280, 3), dtype=np.uint8)
+    folded = np.array([[600, 640], [475, 470], [345, 210], [95, 565]], dtype=np.int32)
+    cv2.polylines(img, [folded], False, (200, 40, 20), 34)
+
+    result = ArmVisionAnalyzer(mode="geometric").analyze(img)
+
+    assert result["mode_used"] == "geometric"
+    keypoints = result["keypoints_px"]
+    assert keypoints["base"][1] > 560
+    assert keypoints["shoulder"][0] > keypoints["elbow"][0]
+    assert keypoints["elbow"][1] < keypoints["shoulder"][1]
+    assert keypoints["gripper_tip"][0] < keypoints["wrist_pitch"][0]
+    assert keypoints["gripper_tip"][1] > keypoints["elbow"][1]
+
+
 def test_neural_predictor_unavailable():
     p = KeypointNeuralPredictor()
     assert p.available is False

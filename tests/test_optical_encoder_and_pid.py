@@ -147,6 +147,46 @@ def test_kalman_exponential_filter_and_optical_audit():
     assert audit_jittery.get("oe_recommendation") in ("READY_FOR_PHASE_2", "HOLD_HIGH")
 
 
+def test_encoder_filter_initializes_from_first_frame_and_clamps_velocity_dt():
+    encoder = VirtualOpticalEncoder()
+
+    def markers(theta):
+        return {
+            0: {"center": (0.0, 0.0), "top_vec": (1.0, 0.0), "angle_deg": 0.0},
+            1: {"center": (10.0, 0.0), "top_vec": (1.0, 0.0), "angle_deg": theta},
+        }
+
+    encoder._detect_aruco = lambda _frame: markers(20.0)
+    first = encoder.read_positions(np.zeros((8, 8, 3), dtype=np.uint8), timestamp_s=1.0)
+    assert first["thetas_deg"][0] == 20.0
+    assert first["omega_vis_dps"] == [0.0] * 6
+
+    encoder._detect_aruco = lambda _frame: markers(21.0)
+    second = encoder.read_positions(np.zeros((8, 8, 3), dtype=np.uint8), timestamp_s=1.001)
+    assert abs(second["thetas_deg"][0] - 20.72) < 1e-6
+    assert abs(second["omega_vis_dps"][0]) < 100.0
+
+
+def test_optical_audit_warms_up_before_evaluating_requested_frames():
+    encoder = VirtualOpticalEncoder()
+    frames = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(33)]
+    calls = []
+
+    def read_positions(frame, timestamp_s=None):
+        calls.append((frame, timestamp_s))
+        return {
+            "thetas_deg": [0.0] * 6,
+            "mode_used": "geometric_fallback",
+            "visible_marker_ids": [],
+        }
+
+    encoder.read_positions = read_positions
+    audit = encoder.audit_pre_power(DummyCamera(frames), num_frames=30)
+
+    assert len(calls) == 33
+    assert audit["frames_evaluated"] == 30
+
+
 def test_nonlinear_pid_deadband_and_gravity():
     """Test NonlinearPIDController deadband, output jump, gravity feedforward."""
     cfg = DEFAULT_JOINT_CONFIGS["J2_shoulder"]  # shoulder joint
