@@ -10,7 +10,6 @@ import math
 import os
 import sys
 import time
-from collections import deque
 from typing import Any, Optional
 
 # Performance env (S10) - best effort
@@ -459,8 +458,8 @@ class ArmVisionAnalyzer:
                     x = 0.25 * mx + 0.75 * prev[0]
                     y = 0.25 * my + 0.75 * prev[1]
                 else:
-                    x = 0.20 * mx + 0.80 * prev[0]
-                    y = 0.20 * my + 0.80 * prev[1]
+                    x = 0.15 * mx + 0.85 * prev[0]
+                    y = 0.15 * my + 0.85 * prev[1]
             else:
                 x, y = mx, my
             current_points[name] = (x, y)
@@ -496,81 +495,119 @@ class ArmVisionAnalyzer:
         if xs.size < 2:
             return None
 
-        # Anchor the traversal at the bottom-most blue region (the base), then
-        # trace the longest in-mask geodesic to the distal gripper end.
-        roi = (xs >= int(frame_w * 0.35)) & (xs <= int(frame_w * 0.60))
-        roi &= (ys >= int(frame_h * 0.55)) & (ys <= int(frame_h * 0.85))
-        roi_xs, roi_ys = xs[roi], ys[roi]
-        if roi_xs.size and int(roi_xs.max() - roi_xs.min()) >= int(frame_w * 0.14):
-            # A broad lower-center blue region is the cylindrical base; its
-            # centroid is more stable than stray blue pixels at the frame edge.
-            base_x = float(roi_xs.mean())
-            base_y = float(roi_ys.mean())
-        else:
-            bottom_band = ys >= int(ys.max()) - max(12, int(frame_h * 0.04))
-            base_x = float(xs[bottom_band].mean())
-            base_y = float(ys[bottom_band].mean())
-        grid_w, grid_h = 160, 90
-        coarse = cv2.resize(sel_mask, (grid_w, grid_h), interpolation=cv2.INTER_NEAREST) > 0
-        grid_ys, grid_xs = np.where(coarse)
-        if grid_xs.size < 2:
-            return None
-        root_x = int(round(base_x * grid_w / frame_w))
-        root_y = int(round(base_y * grid_h / frame_h))
-        root_idx = int(np.argmin((grid_xs - root_x) ** 2 + (grid_ys - root_y) ** 2))
-        root = (int(grid_ys[root_idx]), int(grid_xs[root_idx]))
-        distances = np.full((grid_h, grid_w), -1, dtype=np.int32)
-        parents = np.full((grid_h, grid_w, 2), -1, dtype=np.int16)
-        distances[root] = 0
-        queue = deque([root])
-        while queue:
-            gy, gx = queue.popleft()
-            next_distance = distances[gy, gx] + 1
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    ny, nx = gy + dy, gx + dx
-                    if (dy == 0 and dx == 0) or ny < 0 or nx < 0 or ny >= grid_h or nx >= grid_w:
-                        continue
-                    if coarse[ny, nx] and distances[ny, nx] < 0:
-                        distances[ny, nx] = next_distance
-                        parents[ny, nx] = (gy, gx)
-                        queue.append((ny, nx))
-        reachable_y, reachable_x = np.where(distances >= 0)
-        if reachable_x.size < 2:
-            return None
-        farthest_idx = int(np.argmax(distances[reachable_y, reachable_x]))
-        target = (int(reachable_y[farthest_idx]), int(reachable_x[farthest_idx]))
-        grid_path = [target]
-        while grid_path[-1] != root:
-            py, px = parents[grid_path[-1]]
-            if py < 0 or px < 0:
+        bx, by, bw, bh = cv2.boundingRect(sel_mask)
+
+        def centroid(region, offset_x=0, offset_y=0):
+            moments = cv2.moments(region, binaryImage=True)
+            if moments["m00"] <= 0:
                 return None
-            grid_path.append((int(py), int(px)))
-        grid_path.reverse()
-        scale_x = frame_w / grid_w
-        scale_y = frame_h / grid_h
-        path = [((gx + 0.5) * scale_x, (gy + 0.5) * scale_y) for gy, gx in grid_path]
-        if len(path) >= 5:
-            path_array = np.asarray(path, dtype=float)
-            padded = np.pad(path_array, ((2, 2), (0, 0)), mode="edge")
-            path = [tuple(np.mean(padded[i:i + 5], axis=0)) for i in range(len(path_array))]
-            path[0] = ((root[1] + 0.5) * scale_x, (root[0] + 0.5) * scale_y)
-            path[-1] = ((target[1] + 0.5) * scale_x, (target[0] + 0.5) * scale_y)
-        samples = self._resample(path, 101)
-        fractions = (0.0, 0.22, 0.50, 0.75, 0.88, 1.0)
-        sampled = [samples[int(round(fraction * 100))] for fraction in fractions]
-        # The elbow is the local upper apex for a folded posture. Restrict the
-        # search to the middle of the path so a straight arm remains unchanged.
-        apex_index = min(range(30, 71), key=lambda index: samples[index][1])
-        sampled[2] = samples[apex_index]
-        base, shoulder, elbow, wrist, wrist_roll, tip = [
-            self._local_mask_centroid(sel_mask, point) for point in sampled
-        ]
+            return (
+                float(offset_x + moments["m10"] / moments["m00"]),
+                float(offset_y + moments["m01"] / moments["m00"]),
+            )
+
+        apex_height = max(12, int(0.15 * bh))
+        top_y1 = min(by + apex_height, by + bh)
+        apex = centroid(sel_mask[by:top_y1, bx:bx + bw], bx, by)
+        if apex is None:
+            return None
+        ax, ay = apex
+
+        slice_y0 = by + int(0.35 * bh)
+        slice_y1 = min(by + int(0.85 * bh), by + bh)
+        split_x = min(max(int(ax), bx), bx + bw)
+        middle_slice = sel_mask[slice_y0:slice_y1, bx:bx + bw]
+        left_area = int(cv2.countNonZero(middle_slice[:, :split_x - bx]))
+        right_area = int(cv2.countNonZero(middle_slice[:, split_x - bx:]))
+        is_arch = left_area > 800 and right_area > 800
+
+        if is_arch:
+            shoulder_y0 = max(by, int(ay + 0.15 * bh))
+            shoulder_y1 = min(by + bh, int(by + 0.85 * bh))
+            shoulder_region = sel_mask[shoulder_y0:shoulder_y1, split_x + 1:bx + bw]
+            shoulder = centroid(shoulder_region, split_x + 1, shoulder_y0)
+
+            wrist_y0 = max(by, int(ay + 0.25 * bh))
+            wrist_y1 = min(by + bh, int(ay + 0.72 * bh))
+            wrist_region = sel_mask[wrist_y0:wrist_y1, bx:split_x]
+            wrist_pitch = centroid(wrist_region, bx, wrist_y0)
+
+            roll_y0 = max(by, int(ay + 0.65 * bh))
+            roll_region = sel_mask[roll_y0:by + bh, bx:split_x]
+            wrist_roll = centroid(roll_region, bx, roll_y0)
+            if shoulder is None or wrist_pitch is None or wrist_roll is None:
+                return None
+
+            below_y0 = min(frame_h, max(0, int(math.floor(shoulder[1] + 40.0))))
+            below_region = sel_mask[below_y0:frame_h, split_x + 1:frame_w]
+            below = centroid(below_region, split_x + 1, below_y0)
+            base_y = (
+                below[1]
+                if below is not None
+                else min(frame_h - 20.0, shoulder[1] + 125.0)
+            )
+            base = (shoulder[0], float(base_y))
+
+            # A separate component beyond the wrist-roll joint is the blue
+            # gripper; otherwise extrapolate along the forearm axis.
+            vx = wrist_roll[0] - ax
+            vy = wrist_roll[1] - ay
+            length = math.hypot(vx, vy)
+            if length <= 0.0:
+                return None
+            ux, uy = vx / length, vy / length
+            labels_count, labels, stats, centers = cv2.connectedComponentsWithStats(
+                sel_mask, connectivity=8
+            )
+            roll_x = min(max(int(round(wrist_roll[0])), 0), frame_w - 1)
+            roll_y = min(max(int(round(wrist_roll[1])), 0), frame_h - 1)
+            roll_label = int(labels[roll_y, roll_x])
+            distal_candidates = []
+            for label in range(1, labels_count):
+                if label == roll_label or int(stats[label, cv2.CC_STAT_AREA]) < 20:
+                    continue
+                cx, cy = (float(centers[label, 0]), float(centers[label, 1]))
+                dx, dy = cx - wrist_roll[0], cy - wrist_roll[1]
+                along = dx * ux + dy * uy
+                across = abs(dx * uy - dy * ux)
+                if along > 10.0 and across <= max(35.0, 0.25 * along):
+                    distal_candidates.append((along, (cx, cy)))
+            if distal_candidates:
+                tip = max(distal_candidates, key=lambda candidate: candidate[0])[1]
+            else:
+                extension = 0.42 * length
+                tip = (
+                    wrist_roll[0] + extension * ux,
+                    wrist_roll[1] + extension * uy,
+                )
+            tip = (
+                min(max(float(tip[0]), 0.0), frame_w - 1.0),
+                min(max(float(tip[1]), 0.0), frame_h - 1.0),
+            )
+            elbow = apex
+        else:
+            # Eight continuous horizontal-band centroids form a stable medial
+            # polyline for straight and single-bend silhouettes.
+            edges = np.linspace(float(ys.max()), float(ys.min()), 9)
+            path = []
+            for index in range(8):
+                band_y0 = max(by, int(math.floor(edges[index + 1])))
+                band_y1 = min(by + bh, int(math.ceil(edges[index])) + 1)
+                point = centroid(sel_mask[band_y0:band_y1, bx:bx + bw], bx, band_y0)
+                if point is not None:
+                    path.append(point)
+            if len(path) < 2:
+                path = [(float(xs.mean()), float(ys.max())), (float(xs.mean()), float(ys.min()))]
+            samples = self._resample(path, 101)
+            fractions = (0.0, 0.22, 0.50, 0.75, 0.88, 1.0)
+            base, shoulder, elbow, wrist_pitch, wrist_roll, tip = [
+                samples[int(round(fraction * 100))] for fraction in fractions
+            ]
         kp = {
             "base": (float(base[0]), float(base[1]), 0.8),
             "shoulder": (float(shoulder[0]), float(shoulder[1]), 0.8),
             "elbow": (float(elbow[0]), float(elbow[1]), 0.8),
-            "wrist_pitch": (float(wrist[0]), float(wrist[1]), 0.7),
+            "wrist_pitch": (float(wrist_pitch[0]), float(wrist_pitch[1]), 0.7),
             "wrist_roll": (float(wrist_roll[0]), float(wrist_roll[1]), 0.6),
             "gripper_tip": (float(tip[0]), float(tip[1]), 0.7),
         }

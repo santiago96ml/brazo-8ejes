@@ -70,6 +70,50 @@ def test_geometric_traces_folded_arm_from_base_to_gripper():
     assert keypoints["gripper_tip"][1] > keypoints["elbow"][1]
 
 
+def test_geometric_arched_arm_uses_anatomical_moment_regions():
+    img = np.zeros((720, 1280, 3), dtype=np.uint8)
+    mask = np.zeros(img.shape[:2], dtype=np.uint8)
+    cv2.line(mask, (760, 310), (950, 490), 255, 48)
+    cv2.line(mask, (950, 490), (950, 640), 255, 48)
+    cv2.line(mask, (760, 310), (625, 525), 255, 48)
+    cv2.line(mask, (625, 525), (505, 625), 255, 48)
+    cv2.line(mask, (505, 625), (380, 685), 255, 48)
+
+    analyzer = ArmVisionAnalyzer(mode="geometric")
+    analyzer._blue_mask = lambda frame: (mask, np.zeros_like(mask))
+    result = analyzer._geometric(img)
+
+    assert result is not None
+    keypoints = result[1]
+    assert 700 < keypoints["elbow"][0] < 850
+    assert keypoints["elbow"][1] < 380
+    assert keypoints["shoulder"][0] > keypoints["elbow"][0]
+    assert keypoints["shoulder"][1] > keypoints["elbow"][1]
+    assert keypoints["base"][0] == keypoints["shoulder"][0]
+    assert keypoints["base"][1] > keypoints["shoulder"][1] + 40
+    assert keypoints["wrist_pitch"][0] < keypoints["elbow"][0]
+    assert keypoints["wrist_roll"][0] < keypoints["wrist_pitch"][0]
+    assert keypoints["gripper_tip"][0] < keypoints["wrist_roll"][0]
+    assert keypoints["gripper_tip"][1] > keypoints["wrist_roll"][1]
+
+
+def test_geometric_keypoint_ema_uses_15_percent_median_when_mask_is_stable():
+    analyzer = ArmVisionAnalyzer(mode="geometric")
+    first = {
+        name: (float(index * 10), float(index * 10), 0.8)
+        for index, name in enumerate(analyzer.KEYPOINT_ORDER)
+    }
+    analyzer._smooth_keypoints(first, (100.0, 100.0))
+    shifted = {
+        name: (point[0] + 4.0, point[1] + 4.0, point[2])
+        for name, point in first.items()
+    }
+
+    smoothed = analyzer._smooth_keypoints(shifted, (104.0, 104.0))
+
+    assert smoothed["base"] == (0.3, 0.3, 0.8)
+
+
 def test_local_mask_centroid_ignores_pixels_outside_radius():
     analyzer = ArmVisionAnalyzer(mode="geometric")
     mask = np.zeros((120, 120), dtype=np.uint8)
