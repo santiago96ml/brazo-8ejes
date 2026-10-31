@@ -1,0 +1,28 @@
+{
+  "dictionary": "DICT_4X4_50",
+  "marker_size_mm": 20.0,
+  "gripper_marker_size_mm": 12.0,
+  "filter_alpha": 0.72,
+  "audit_frames": 30,
+  "max_audit_variance_deg": 0.15,
+  "homing_lock_tol_deg": 0.5,
+  "marker_map": {
+    "0": "world_anchor",
+    "1": "base_turntable",
+    "2": "shoulder_lift",
+    "3": "elbow_flex",
+    "4": "wrist_pitch_roll",
+    "5": "gripper_left_jaw",
+    "6": "gripper_right_jaw"
+  },
+  "home_offsets_deg": {
+    "theta1": 0.0,
+    "theta2": 0.0,
+    "theta3": 0.0,
+    "theta4": 0.0,
+    "theta5": 0.0,
+    "theta6": 0.0
+  },
+  "gripper_mm_range": [0.0, 80.0],
+  "gripper_px_per_mm": 2.5
+}
