@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import time
 from types import SimpleNamespace
@@ -304,10 +305,103 @@ def test_return_to_start_converges_on_simulated_arm():
     assert abs(arm.thetas[1] - controller.start_thetas_deg[1]) <= controller.tolerance_deg
 
 
+class FirmwareStateTransport(FakeTransport):
+    def __init__(self, arm, coupling=1, pulses=None):
+        super().__init__(arm)
+        self.rx_queue = queue.Queue()
+        self.coupling = coupling
+        self.pulses = pulses if pulses is not None else {
+            motor: int(round(arm.odometry.deg_to_pulse(motor, angle)))
+            for motor, angle in arm.odometry.thetas_to_motors(arm.thetas).items()
+        }
+
+    def send_line(self, command):
+        self.commands.append(command)
+        if command == "Q":
+            self.rx_queue.put(json.dumps({
+                "status": "STATE",
+                "oe": 1,
+                "shoulder_coupling": self.coupling,
+                "motors": [
+                    {"m": motor, "pulse": pulse}
+                    for motor, pulse in self.pulses.items()
+                ],
+            }))
+            return
+        if command.startswith("P"):
+            motor_text, pulse_text = command[1:].split(":", 1)
+            self.pulses[int(motor_text)] = int(pulse_text)
+
+
+def test_apply_pulse_delta_clamps_and_mirrors_motor_six():
+    arm = FakeArm()
+    odometry = arm.odometry
+    transport = FirmwareStateTransport(
+        arm,
+        coupling=-1,
+        pulses={5: 490, 6: 120, 1: 307, 2: 307, 3: 307, 4: 307, 7: 307},
+    )
+    controller = ClosedLoopArmController(transport=transport)
+
+    pulse = controller.apply_pulse_delta(6, 500)
+
+    assert pulse == int(odometry._calib[6]["pulse_max"])
+    assert transport.pulses[6] == int(odometry._calib[6]["pulse_max"])
+    assert transport.pulses[5] == int(odometry._calib[5]["pulse_min"])
+    assert transport.commands[-2:] == [
+        f"P6:{int(odometry._calib[6]['pulse_max'])}",
+        f"P5:{int(odometry._calib[5]['pulse_min'])}",
+    ]
+
+
+def test_apply_pulse_delta_mirrors_motor_six_with_positive_coupling():
+    arm = FakeArm()
+    transport = FirmwareStateTransport(
+        arm,
+        coupling=1,
+        pulses={5: 200, 6: 300, 1: 307, 2: 307, 3: 307, 4: 307, 7: 307},
+    )
+    controller = ClosedLoopArmController(transport=transport)
+
+    controller.apply_pulse_delta(6, 25)
+
+    assert transport.pulses[6] == 325
+    assert transport.pulses[5] == 225
+    assert transport.commands[-2:] == ["P6:325", "P5:225"]
+
+
+def test_move_to_xyz_openloop_refuses_unreachable_target_without_pulses():
+    controller, _arm, transport = make_controller()
+    result = controller.move_to_xyz_openloop(150, 0, 0)
+
+    assert result == {"ok": False, "reason": "unreachable"}
+    assert not any(command.startswith("P") for command in transport.commands)
+
+
+def test_openloop_step_reports_excessive_vision_drift(monkeypatch):
+    controller, _arm, _transport = make_controller()
+    states = [
+        {"valid": True, "thetas_deg": [0, 90, 0, 0, 0, 50]},
+        {"valid": True, "thetas_deg": [20, 90, 0, 0, 0, 50]},
+    ]
+    controller.read_state = lambda **_kwargs: states.pop(0)
+    controller.apply_pulse_delta = lambda *_args: 330
+    monkeypatch.setattr("src.closed_loop_controller.time.sleep", lambda _seconds: None)
+
+    result = controller.move_delta_openloop(0, 10)
+
+    assert result["ok"] is False
+    assert result["reason"] == "drift"
+    assert result["verified"] is True
+    assert result["measured_deg"] == 20
+    assert result["drift_deg"] == 10
+
+
 def test_autonomous_demo_restores_start_after_step_three_failure(monkeypatch, capsys):
     class FailingController:
         def __init__(self, **_kwargs):
             self.return_calls = 0
+            self.delta_calls = 0
 
         def connect(self):
             return {"ok": True}
@@ -315,7 +409,8 @@ def test_autonomous_demo_restores_start_after_step_three_failure(monkeypatch, ca
         def read_state(self, **_kwargs):
             return {"valid": True, "thetas_deg": [20.0, 90.0, 0.0, 0.0, 0.0, 50.0]}
 
-        def move_to_thetas(self, *_args, **_kwargs):
+        def move_delta_openloop(self, *_args, **_kwargs):
+            self.delta_calls += 1
             return {"ok": False, "reason": "simulated_failure"}
 
         def move_joint(self, *_args, **_kwargs):
@@ -343,5 +438,5 @@ def test_autonomous_demo_restores_start_after_step_three_failure(monkeypatch, ca
 
     assert status == 1
     assert report["status"] == "ABORT_STEP_3"
-    assert report["return_to_start"] == {"ok": True, "final_error_deg": [0.0] * 6}
-    assert controller.return_calls == 1
+    assert report["return_to_start"]["ok"] is True
+    assert controller.delta_calls == 1

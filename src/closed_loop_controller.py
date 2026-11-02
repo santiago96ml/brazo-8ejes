@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import math
+import queue
 import time
 from typing import Any
 
@@ -13,9 +15,11 @@ try:
         NonlinearPIDController,
     )
     from .pulse_odometry import PulseOdometry
+    from .kinematics_6dof import RobotArm6DOF, WorkspaceCollisionError
 except ImportError:  # pragma: no cover - supports direct module execution
     from pid_pwm_controller import DecisionGate, JointPIDConfig, NonlinearPIDController
     from pulse_odometry import PulseOdometry
+    from kinematics_6dof import RobotArm6DOF, WorkspaceCollisionError
 
 
 _JOINTS = (
@@ -51,6 +55,8 @@ class ClosedLoopArmController:
         max_slew_counts_per_cycle: int = 12,
         audit_max_variance: float | None = None,
         max_audit_attempts: int = 6,
+        control_mode: str = "open_loop",
+        max_step_deg: float = 25.0,
     ):
         if float(control_hz) <= 0:
             raise ValueError("control_hz must be greater than zero")
@@ -64,6 +70,10 @@ class ClosedLoopArmController:
             not math.isfinite(float(audit_max_variance)) or float(audit_max_variance) <= 0
         ):
             raise ValueError("audit_max_variance must be a finite positive number")
+        if control_mode not in ("open_loop", "closed_loop"):
+            raise ValueError("control_mode must be 'open_loop' or 'closed_loop'")
+        if not math.isfinite(float(max_step_deg)) or float(max_step_deg) <= 0:
+            raise ValueError("max_step_deg must be a finite positive number")
 
         self.camera = camera
         self.encoder = encoder
@@ -78,6 +88,8 @@ class ClosedLoopArmController:
             None if audit_max_variance is None else float(audit_max_variance)
         )
         self.max_audit_attempts = int(max_audit_attempts)
+        self.control_mode = control_mode
+        self.max_step_deg = float(max_step_deg)
         self.odometry = PulseOdometry()
         self._controllers = self._build_controllers()
         self._decision_gate = DecisionGate(
@@ -161,6 +173,204 @@ class ClosedLoopArmController:
     def _send_pulse(self, motor: int, pulse: int) -> None:
         self._send(f"P{motor}:{int(pulse)}")
         self._last_sent_pulses[motor] = int(pulse)
+
+    def read_firmware_state(self) -> dict:
+        """Query firmware-owned servo pulse targets without consulting vision."""
+        if self.transport is None:
+            raise RuntimeError("serial transport is not connected")
+        rx_queue = getattr(self.transport, "rx_queue", None)
+        if rx_queue is None or not callable(getattr(rx_queue, "get", None)):
+            raise RuntimeError("transport does not expose a response queue")
+
+        deadline = time.monotonic() + 1.0
+        self._send("Q")
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("firmware STATE response timed out")
+            try:
+                raw = rx_queue.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise TimeoutError("firmware STATE response timed out") from exc
+            try:
+                state = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                continue
+            if not isinstance(state, dict) or state.get("status") != "STATE":
+                continue
+
+            pulses: dict[int, int] = {}
+            motors = state.get("motors", state.get("ch", []))
+            for item in motors if isinstance(motors, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                motor = item.get("m")
+                channel = item.get("ch", item.get("c"))
+                if motor is None and channel is not None:
+                    motor = int(channel) + 1
+                pulse = item.get("pulse", item.get("p"))
+                if motor is not None and pulse is not None:
+                    pulses[int(motor)] = int(pulse)
+            if not pulses:
+                raise ValueError("firmware STATE response did not contain motor pulses")
+            try:
+                oe = int(state.get("oe", 1))
+            except (TypeError, ValueError):
+                oe = 1 if str(state.get("oe", "")).upper() == "HIGH" else 0
+            coupling = int(state.get("shoulder_coupling", self.odometry.shoulder_coupling))
+            if coupling in (-1, 1):
+                self.odometry.set_shoulder_coupling(coupling)
+            return {"pulses": pulses, "oe": oe, "shoulder_coupling": coupling}
+
+    def apply_pulse_delta(self, motor: int, delta_pulse: int) -> int:
+        """Move a firmware-referenced pulse target, mirroring the shoulder pair."""
+        motor = int(motor)
+        if motor < 1 or motor > 7:
+            raise ValueError("motor must be 1..7")
+        state = self.read_firmware_state()
+        pulses = state["pulses"]
+        self._last_sent_pulses.update({
+            int(key): int(value) for key, value in pulses.items()
+            if 1 <= int(key) <= 7
+        })
+        if motor not in pulses:
+            raise ValueError(f"firmware state is missing motor {motor}")
+        coupling = int(state["shoulder_coupling"])
+        if coupling not in (-1, 1):
+            raise ValueError("firmware shoulder coupling must be +1 or -1")
+        motors = [(motor, int(delta_pulse))]
+        if motor in (5, 6):
+            partner = 6 if motor == 5 else 5
+            if partner not in pulses:
+                raise ValueError(f"firmware state is missing motor {partner}")
+            mirror_delta = int(delta_pulse) if coupling == 1 else -int(delta_pulse)
+            motors.append((partner, mirror_delta))
+
+        result_pulse = None
+        for target_motor, delta in motors:
+            calibration = self.odometry._calib[target_motor]
+            minimum = int(round(float(calibration["pulse_min"])))
+            maximum = int(round(float(calibration["pulse_max"])))
+            target = max(minimum, min(maximum, int(pulses[target_motor]) + delta))
+            self._send_pulse(target_motor, target)
+            if target_motor == motor:
+                result_pulse = target
+        return int(result_pulse)
+
+    def move_delta_openloop(self, joint_index: int, delta_deg: float,
+                            settle_s: float = 0.9) -> dict:
+        """Apply one calibrated pulse step and assess it once with visual feedback."""
+        joint_index = int(joint_index)
+        if joint_index < 0 or joint_index > 5:
+            raise ValueError("joint_index must be a theta index 0..5")
+        delta_deg = float(delta_deg)
+        if not math.isfinite(delta_deg):
+            raise ValueError("delta_deg must be finite")
+        commanded_deg = max(-self.max_step_deg, min(self.max_step_deg, delta_deg))
+        motor = _JOINTS[joint_index][1]
+        calibration = self.odometry._calib[motor]
+        stop_deg = float(calibration["home_deg"])
+        delta_pulse = (
+            self.odometry.deg_to_pulse(motor, stop_deg + commanded_deg)
+            - self.odometry.deg_to_pulse(motor, stop_deg)
+        )
+
+        try:
+            before = self.read_state(wait_fresh=True, timeout_s=1.0)
+        except Exception:
+            before = {"valid": False}
+        before_thetas = before.get("thetas_deg", []) if before.get("valid") else []
+        try:
+            self.apply_pulse_delta(motor, delta_pulse)
+            time.sleep(max(0.0, float(settle_s)))
+            after = self.read_state(wait_fresh=True, timeout_s=1.0)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": str(exc),
+                "verified": False,
+                "commanded_deg": commanded_deg,
+                "measured_deg": None,
+                "drift_deg": None,
+                "pulses": dict(self._last_sent_pulses),
+            }
+
+        verified = bool(before.get("valid")) and bool(after.get("valid"))
+        measured_deg = None
+        drift_deg = None
+        if verified:
+            measured_deg = _wrap_deg(
+                float(after["thetas_deg"][joint_index]) - float(before_thetas[joint_index])
+            )
+            drift_deg = _wrap_deg(measured_deg - commanded_deg)
+        ok = not verified or abs(drift_deg) <= max(6.0, 0.45 * abs(commanded_deg))
+        return {
+            "ok": bool(ok),
+            "reason": "verified" if ok and verified else ("unverified" if ok else "drift"),
+            "verified": verified,
+            "commanded_deg": float(commanded_deg),
+            "measured_deg": None if measured_deg is None else float(measured_deg),
+            "drift_deg": None if drift_deg is None else float(drift_deg),
+            "pulses": dict(self._last_sent_pulses),
+        }
+
+    def move_to_xyz_openloop(self, x_mm: float, y_mm: float, z_mm: float,
+                             pitch_deg: float = 0.0, roll_deg: float = 0.0,
+                             grip_percent: float = 50.0, settle_s: float = 1.2) -> dict:
+        arm = RobotArm6DOF()
+        target_mm = [float(x_mm), float(y_mm), float(z_mm)]
+        try:
+            target_thetas = arm.inverse_kinematics(
+                *target_mm,
+                pitch_deg=float(pitch_deg),
+                roll_deg=float(roll_deg),
+                grip_percent=float(grip_percent),
+            )
+        except WorkspaceCollisionError:
+            return {"ok": False, "reason": "unreachable"}
+
+        current = self.read_state(wait_fresh=True, timeout_s=1.0)
+        if not current.get("valid"):
+            return {"ok": False, "reason": "invalid_start_pose"}
+        start_thetas = [float(value) for value in current["thetas_deg"][:6]]
+        for joint_index in range(6):
+            delta = _wrap_deg(float(target_thetas[joint_index]) - start_thetas[joint_index])
+            if abs(delta) < 1e-9:
+                continue
+            result = self.move_delta_openloop(joint_index, delta, settle_s=settle_s)
+            if not result.get("ok") and result.get("reason") != "drift":
+                return {
+                    "ok": False,
+                    "reason": result.get("reason", "move_failed"),
+                    "target_mm": target_mm,
+                }
+
+        measured = self.read_state(wait_fresh=True, timeout_s=1.0)
+        if not measured.get("valid"):
+            return {
+                "ok": False,
+                "reason": "vision_unavailable",
+                "target_mm": target_mm,
+                "measured_mm": None,
+                "error_mm": None,
+                "thetas": None,
+            }
+        thetas = [float(value) for value in measured["thetas_deg"][:6]]
+        fk = arm.forward_kinematics(thetas)
+        measured_mm = [float(value) for value in fk["tcp_mm"]]
+        error_mm = math.sqrt(sum((actual - target) ** 2
+                                 for actual, target in zip(measured_mm, target_mm)))
+        joints_close = all(
+            abs(_wrap_deg(float(target) - actual)) <= 8.0
+            for target, actual in zip(target_thetas, thetas)
+        )
+        return {
+            "ok": bool(error_mm <= 35.0 or joints_close),
+            "target_mm": target_mm,
+            "measured_mm": measured_mm,
+            "error_mm": float(error_mm),
+            "thetas": thetas,
+        }
 
     def _preload_pulses(self, thetas: list[float]) -> None:
         motors = self.odometry.thetas_to_motors(thetas)
