@@ -109,6 +109,18 @@ class TestSingleMotorTest(unittest.TestCase):
         self.assertEqual(result["status"], "ABORT_PROBE")
         self.assertEqual(transport.commands[-1], "S")
 
+    def test_probe_runs_after_enable_not_before(self):
+        encoder = FakeEncoder(audit_variance=0.5)
+        transport = FakeTransport(encoder, probe_motion=True)
+        result, _camera, _encoder, transport = self.run_test(encoder=encoder, transport=transport)
+
+        self.assertEqual(result["status"], "OK")
+        self.assertIn("R", transport.commands)
+        r_index = transport.commands.index("R")
+        probe_indexes = [i for i, c in enumerate(transport.commands) if c.startswith("T1:") and c != "T1:0:1"]
+        self.assertTrue(probe_indexes, "expected at least one probe/burst pulse")
+        self.assertLess(r_index, probe_indexes[0], "OE must be enabled before any timed pulse")
+
     def test_happy_path_measures_motion_and_stops(self):
         encoder = FakeEncoder(audit_variance=0.5)
         result, _camera, _encoder, transport = self.run_test(encoder=encoder)

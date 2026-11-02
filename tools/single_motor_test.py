@@ -268,6 +268,13 @@ def run_single_motor_test(
         }
         result["snapshot"] = _save_snapshot(last_frame, snapshot)
 
+        # The probe pulse only produces motion with the outputs enabled, so OE must be
+        # lowered BEFORE probing. The 3-consecutive-pass gate above already authorized it.
+        if not dry_run:
+            send("R")
+            time.sleep(0.150)
+        encoder.set_oe_state(oe_high=False, active_command=True)
+
         probe = None
         if needs_probe:
             probe_motor = 5 if motor == 6 else motor
@@ -281,7 +288,6 @@ def run_single_motor_test(
                     "command": probe["command"],
                 }
             else:
-                encoder.set_oe_state(oe_high=True, active_command=True)
                 send(probe["command"])
                 time.sleep(int(probe_ms) / 1000.0)
                 after_probe, probe_timestamp, _probe_reading = _wait_for_new_angle(
@@ -317,9 +323,6 @@ def run_single_motor_test(
             result["status"] = "OK"
             return result
 
-        send("R")
-        time.sleep(0.150)
-        encoder.set_oe_state(oe_high=False, active_command=True)
         send(command)
         move_attempted = True
         measured_delta = _measure_response(camera, encoder, motor, baseline_deg, int(burst_ms))
