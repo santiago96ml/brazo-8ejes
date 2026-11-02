@@ -534,7 +534,7 @@ class VirtualOpticalEncoder:
             "latency_ms": float(latency_ms),
         }
 
-    def audit_pre_power(self, frames_iterable_or_camera, num_frames: int = 30, max_variance_deg: float = 0.15, require_all_aruco: bool = False) -> dict:
+    def audit_pre_power(self, frames_iterable_or_camera, num_frames: int = 30, max_variance_deg: float | None = 0.15, require_all_aruco: bool = False) -> dict:
         # Start every audit from a clean filter state before consuming frames.
         self.reset_filter()
         self.oe_high = True
@@ -599,7 +599,7 @@ class VirtualOpticalEncoder:
                 "max_variance_deg2": 999.0,
                 "primary_max_variance_deg2": 999.0,
                 "secondary_max_variance_deg2": 999.0,
-                "max_Limit_deg2": float(max_variance_deg),
+                "max_Limit_deg2": float(max_variance_deg) if max_variance_deg is not None else 1.5,
                 "reason": "no_frames_captured",
             }
 
@@ -672,8 +672,13 @@ class VirtualOpticalEncoder:
         primary_max_var = max(variances[:4]) if variances else 999.0
         secondary_max_var = max(variances[4:6]) if variances else 999.0
         max_var = primary_max_var
-        secondary_limit = max(1.5, float(max_variance_deg) * 3.0)
-        passed = (primary_max_var < float(max_variance_deg)
+        mode_used = modes[-1] if modes else "none"
+        effective_max_variance = (
+            (5.0 if mode_used == "geometric_fallback" else 1.5)
+            if max_variance_deg is None else float(max_variance_deg)
+        )
+        secondary_limit = max(1.5, effective_max_variance * 3.0)
+        passed = (primary_max_var < effective_max_variance
                   and secondary_max_var < secondary_limit)
 
         if require_all_aruco:
@@ -684,7 +689,6 @@ class VirtualOpticalEncoder:
                     passed = False
                     break
 
-        mode_used = modes[-1] if modes else "none"
         # build resting motors from means
         resting_motors = {
             1: float(means[5]),
@@ -700,7 +704,7 @@ class VirtualOpticalEncoder:
             visible_ids_union.update(r.get("visible_marker_ids", []))
         reason = "stable" if passed else (
             f"excessive_variance primary={primary_max_var:.6f} "
-            f"(limit {max_variance_deg}) secondary={secondary_max_var:.6f} "
+            f"(limit {effective_max_variance}) secondary={secondary_max_var:.6f} "
             f"(limit {secondary_limit})"
         )
         return {
@@ -715,7 +719,8 @@ class VirtualOpticalEncoder:
             "max_variance_deg2": float(max_var),
             "primary_max_variance_deg2": float(primary_max_var),
             "secondary_max_variance_deg2": float(secondary_max_var),
-            "max_Limit_deg2": float(max_variance_deg),
+            "max_Limit_deg2": effective_max_variance,
+            "variance_limit_deg2": effective_max_variance,
             "reason": reason,
         }
 

@@ -48,6 +48,20 @@ def _is_retryable_port_error(exc: Exception) -> bool:
     return isinstance(exc, serial.SerialException)
 
 
+def _variance_limit_for_mode(
+    mode_used: str,
+    max_variance: float | None,
+    strict: bool,
+) -> tuple[float, str]:
+    if strict:
+        return 1.5, "strict"
+    if max_variance is not None:
+        return float(max_variance), "cli"
+    if mode_used == "geometric_fallback":
+        return 5.0, "auto_geometric"
+    return 1.5, "auto_aruco"
+
+
 def _joint_angle(reading: dict, motor: int) -> float:
     if motor not in _MOTOR_JOINTS:
         raise ValueError("Motor 8 (AUX) has no optical joint angle and cannot be verified safely")
@@ -145,6 +159,8 @@ def run_single_motor_test(
     camera_index: int = 0,
     frames: int = 30,
     max_audit_attempts: int = 6,
+    max_variance: float | None = None,
+    strict: bool = False,
     delta_deg: float = 8.0,
     burst_ms: int = 400,
     probe_ms: int = 40,
@@ -165,6 +181,10 @@ def run_single_motor_test(
         raise ValueError("frames must be at least 1")
     if int(max_audit_attempts) < 1:
         raise ValueError("max_audit_attempts must be at least 1")
+    if max_variance is not None and (
+        not math.isfinite(float(max_variance)) or float(max_variance) <= 0
+    ):
+        raise ValueError("max_variance must be a finite positive number")
     if int(burst_ms) < 1 or int(probe_ms) < 1:
         raise ValueError("pulse durations must be positive")
 
@@ -176,6 +196,9 @@ def run_single_motor_test(
 
     requested_port = port
     port_used, port_autodetected = resolve_serial_port(port)
+    initial_variance_limit, initial_variance_source = _variance_limit_for_mode(
+        "none", max_variance, strict
+    )
 
     decision_gate = DecisionGate(
         max_audit_variance_deg2=1.5,
@@ -207,6 +230,8 @@ def run_single_motor_test(
         "port_used": port_used,
         "port_autodetected": port_autodetected,
         "audit_attempts": 0,
+        "variance_limit_deg2": initial_variance_limit,
+        "variance_limit_source": initial_variance_source,
         "audit": {},
         "decision_gate": {},
         "baseline": {},
@@ -226,9 +251,13 @@ def run_single_motor_test(
         audits = []
         gate_results = []
         for attempt in range(int(max_audit_attempts)):
+            requested_limit, _requested_source = _variance_limit_for_mode(
+                "none", max_variance, strict
+            )
+            audit_limit = requested_limit if strict or max_variance is not None else None
             try:
                 audit = encoder.audit_pre_power(
-                    camera, num_frames=int(frames), max_variance_deg=1.5
+                    camera, num_frames=int(frames), max_variance_deg=audit_limit
                 )
             except Exception as exc:
                 audit = {
@@ -240,10 +269,18 @@ def run_single_motor_test(
                     "mode_used": "none",
                     "visible_marker_ids": [],
                 }
+            mode_used = str(audit.get("mode_used", "none"))
+            variance_limit, variance_source = _variance_limit_for_mode(
+                mode_used, max_variance, strict
+            )
+            audit["variance_limit_deg2"] = variance_limit
+            audit["variance_limit_source"] = variance_source
+            result["variance_limit_deg2"] = variance_limit
+            result["variance_limit_source"] = variance_source
             frames_evaluated = int(audit.get("frames_evaluated", 0))
             if frames_evaluated > 0:
                 variance = float(audit.get("max_variance_deg2", 999.0))
-                audit["passed"] = bool(audit.get("passed")) and variance < 1.5
+                audit["passed"] = bool(audit.get("passed")) and variance < variance_limit
                 gate_results.append(decision_gate.record_audit(audit))
             else:
                 # An empty capture breaks consecutiveness without counting as a measured audit.
@@ -257,18 +294,24 @@ def run_single_motor_test(
                 time.sleep(0.35)
         last_audit = audits[-1]
         max_variance = float(last_audit.get("max_variance_deg2", 999.0))
+        audit_passed = decision_gate.consecutive_passes >= 3
         result["audit"] = {
-            "passed": decision_gate.consecutive_passes >= 3,
+            "passed": audit_passed,
             "max_variance_deg2": max_variance,
             "frames_evaluated": [int(item.get("frames_evaluated", 0)) for item in audits],
             "mode_used": last_audit.get("mode_used", "none"),
             "visible_marker_ids": last_audit.get("visible_marker_ids", []),
-            "reason": last_audit.get("reason"),
+            "reason": "stable" if audit_passed else "three_consecutive_passes_not_reached",
+            "last_attempt_reason": last_audit.get("reason"),
             "results": [
                 {
                     "passed": bool(item.get("passed")),
                     "max_variance_deg2": float(item.get("max_variance_deg2", 999.0)),
                     "frames_evaluated": int(item.get("frames_evaluated", 0)),
+                    "mode_used": item.get("mode_used", "none"),
+                    "variance_limit_deg2": float(item.get("variance_limit_deg2", 1.5)),
+                    "variance_limit_source": item.get("variance_limit_source", "auto_aruco"),
+                    "reason": item.get("reason"),
                 }
                 for item in audits
             ],
@@ -442,6 +485,14 @@ def main(argv: list[str] | None = None) -> int:
         "--max-audit-attempts", type=int, default=6,
         help="maximum pre-power audit attempts (default: 6)",
     )
+    parser.add_argument(
+        "--max-variance", type=float, default=None,
+        help="force the audit variance limit (default: mode-aware auto)",
+    )
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="force the 1.5 deg^2 audit limit in every optical mode",
+    )
     parser.add_argument("--delta-deg", type=float, default=8.0)
     parser.add_argument("--burst-ms", type=int, default=400)
     parser.add_argument("--probe-ms", type=int, default=40)
@@ -464,6 +515,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_single_motor_test(
                 motor=motor, port=args.port, camera_index=args.camera,
                 frames=args.frames, max_audit_attempts=args.max_audit_attempts,
+                max_variance=args.max_variance, strict=args.strict,
                 delta_deg=args.delta_deg,
                 burst_ms=args.burst_ms, probe_ms=args.probe_ms,
                 dry_run=args.dry_run, snapshot=snapshot,
@@ -474,6 +526,12 @@ def main(argv: list[str] | None = None) -> int:
                 "port_requested": args.port, "port_used": args.port,
                 "port_autodetected": False,
                 "audit_attempts": 0,
+                "variance_limit_deg2": 1.5 if args.strict else (
+                    args.max_variance if args.max_variance is not None else 1.5
+                ),
+                "variance_limit_source": "strict" if args.strict else (
+                    "cli" if args.max_variance is not None else "auto_aruco"
+                ),
                 "audit": {"reason": f"error:{exc}"},
                 "decision_gate": {}, "baseline": {},
                 "commanded": {"offset": 0, "ms": args.burst_ms},

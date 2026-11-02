@@ -1,6 +1,8 @@
 import unittest
+import math
 from unittest.mock import call, patch
 
+from src.virtual_optical_encoder import VirtualOpticalEncoder
 from tools.single_motor_test import run_single_motor_test
 
 
@@ -35,8 +37,9 @@ class FakeEncoder:
 
     def audit_pre_power(self, camera, num_frames, max_variance_deg):
         self.audit_calls += 1
+        limit = 1.5 if max_variance_deg is None else max_variance_deg
         return {
-            "passed": self.audit_variance < max_variance_deg,
+            "passed": self.audit_variance < limit,
             "frames_evaluated": num_frames,
             "mode_used": "aruco",
             "visible_marker_ids": [0, 1, 2, 3, 4, 5],
@@ -64,10 +67,32 @@ class SequenceAuditEncoder(FakeEncoder):
     def audit_pre_power(self, camera, num_frames, max_variance_deg):
         variance = self.variances[self.audit_calls]
         self.audit_calls += 1
+        limit = 1.5 if max_variance_deg is None else max_variance_deg
         return {
-            "passed": variance < max_variance_deg,
+            "passed": variance < limit,
             "frames_evaluated": num_frames,
             "mode_used": "aruco",
+            "visible_marker_ids": [0, 1, 2, 3, 4, 5],
+            "variances_deg2": [variance] * 6,
+            "max_variance_deg2": variance,
+        }
+
+
+class ModeVarianceEncoder(FakeEncoder):
+    def __init__(self, mode, variance):
+        super().__init__(audit_variance=variance)
+        self.mode = mode
+
+    def audit_pre_power(self, camera, num_frames, max_variance_deg):
+        self.audit_calls += 1
+        mode_limit = (
+            5.0 if self.mode == "geometric_fallback" else 1.5
+        ) if max_variance_deg is None else max_variance_deg
+        variance = self.audit_variance
+        return {
+            "passed": variance < mode_limit,
+            "frames_evaluated": num_frames,
+            "mode_used": self.mode,
             "visible_marker_ids": [0, 1, 2, 3, 4, 5],
             "variances_deg2": [variance] * 6,
             "max_variance_deg2": variance,
@@ -207,8 +232,91 @@ class TestSingleMotorTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "ABORT_AUDIT")
         self.assertEqual(result["audit_attempts"], 6)
+        self.assertEqual(
+            result["audit"]["reason"], "three_consecutive_passes_not_reached",
+        )
         self.assertEqual(result["decision_gate"]["consecutive_passes"], 0)
         self.assertNotIn("R", transport.commands)
+
+    def _run_mode_limit_test(self, mode, variance, **options):
+        clock = {"now": 0.0}
+
+        def monotonic():
+            return clock["now"]
+
+        def sleep(duration):
+            clock["now"] += duration
+
+        encoder = ModeVarianceEncoder(mode, variance)
+        camera = FakeCamera()
+        transport = FakeTransport(encoder)
+        with patch("tools.single_motor_test.time.monotonic", side_effect=monotonic), \
+             patch("tools.single_motor_test.time.sleep", side_effect=sleep), \
+             patch("host.armctl.transport.resolve_serial_port", return_value=("COM8", True)):
+            result = run_single_motor_test(
+                motor=1, port="auto", frames=3, max_audit_attempts=3,
+                camera=camera, encoder=encoder, transport=transport, dry_run=True,
+                **options,
+            )
+        return result, transport
+
+    def test_auto_geometric_limit_accepts_variance_three(self):
+        result, _transport = self._run_mode_limit_test("geometric_fallback", 3.0)
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["variance_limit_deg2"], 5.0)
+        self.assertEqual(result["variance_limit_source"], "auto_geometric")
+
+    def test_auto_aruco_limit_rejects_variance_three(self):
+        result, transport = self._run_mode_limit_test("aruco", 3.0)
+
+        self.assertEqual(result["status"], "ABORT_AUDIT")
+        self.assertEqual(result["variance_limit_deg2"], 1.5)
+        self.assertEqual(result["variance_limit_source"], "auto_aruco")
+        self.assertNotIn("R", transport.commands)
+
+    def test_cli_variance_override_and_strict_limit_sources(self):
+        cli_result, _transport = self._run_mode_limit_test(
+            "geometric_fallback", 3.0, max_variance=3.5,
+        )
+        strict_result, _transport = self._run_mode_limit_test(
+            "geometric_fallback", 3.0, strict=True,
+        )
+
+        self.assertEqual(cli_result["status"], "OK")
+        self.assertEqual(cli_result["variance_limit_deg2"], 3.5)
+        self.assertEqual(cli_result["variance_limit_source"], "cli")
+        self.assertEqual(strict_result["status"], "ABORT_AUDIT")
+        self.assertEqual(strict_result["variance_limit_deg2"], 1.5)
+        self.assertEqual(strict_result["variance_limit_source"], "strict")
+
+    def test_encoder_auto_limit_uses_detected_mode(self):
+        def run_audit(mode):
+            encoder = VirtualOpticalEncoder()
+
+            def read_positions(frame, timestamp_s=None):
+                encoder._last_window_thetas = None
+                angle = math.sqrt(3.0) * (1 if int(frame) % 2 else -1)
+                return {
+                    "mode_used": mode,
+                    "thetas_deg": [angle, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    "visible_marker_ids": [],
+                }
+
+            with patch.object(encoder, "read_positions", side_effect=read_positions):
+                return encoder.audit_pre_power(
+                    list(range(40)), num_frames=30, max_variance_deg=None,
+                )
+
+        geometric = run_audit("geometric_fallback")
+        aruco = run_audit("aruco")
+
+        self.assertAlmostEqual(geometric["max_variance_deg2"], 3.0)
+        self.assertTrue(geometric["passed"])
+        self.assertEqual(geometric["variance_limit_deg2"], 5.0)
+        self.assertAlmostEqual(aruco["max_variance_deg2"], 3.0)
+        self.assertFalse(aruco["passed"])
+        self.assertEqual(aruco["variance_limit_deg2"], 1.5)
 
     def test_failed_audit_aborts_without_enabling_oe(self):
         encoder = FakeEncoder(audit_variance=9.0)

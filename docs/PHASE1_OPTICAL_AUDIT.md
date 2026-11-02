@@ -4,8 +4,10 @@
 Phase 1 proves the arm is optically stable with servos always OFF (`OE=HIGH`). It validates that the virtual optical encoder can read joint positions (via ArUco markers, with geometric fallback) without energizing the servo rail. Only after passing the audit can the system proceed to bring-up.
 
 ## Operational vs strict gate
-- **Operational gate (default):** `max_variance_deg2 < 1.5` (`--max-variance`, default). This is the gate used by `DecisionGate` to allow progression to `R`. Requires **3 consecutive passes** before enabling outputs.
+- **Standalone checker gate:** `tools/check_camera_positions.py` defaults to `max_variance_deg2 < 1.5` (`--max-variance`). This checker reports stability; the single-motor tool's mode-aware progression gate is described below.
 - **Strict/ArUco-grade target:** `0.15 deg^2` (`--strict`), not required in geometric mode. This is the metrology target when using ArUco markers for high-precision measurements.
+
+For `tools/single_motor_test.py`, the automatic per-window limit is mode-aware: ArUco and partial-ArUco audits use 1.5 deg², while geometric fallback uses 5.0 deg². Geometric fallback is a noisier, supervision-only estimator, so 5.0 deg² tolerates ordinary pixel/angle noise for a bounded single-motor bring-up without treating it as metrology-grade. Its `--max-variance` forces a chosen limit; its `--strict` forces 1.5 deg² in either mode. (`tools/check_camera_positions.py --strict` remains the separate 0.15 deg² metrology target.) The single-motor tool still requires three consecutive passes within its bounded audit-attempt window.
 
 ## Audit command
 Use `tools/check_camera_positions.py` (or equivalent) to run the pre-power audit:
