@@ -84,6 +84,34 @@ def test_fail_on_step3_calls_stop(monkeypatch, capsys):
     assert any("STEP" in l for l in lines)
 
 
+def test_connect_failure_details_are_in_json(monkeypatch, capsys):
+    class FakeControllerConnectFailure(FakeControllerOK):
+        def connect(self):
+            return {
+                "ok": False,
+                "reason": "three_consecutive_passes_not_reached",
+                "audits": [{"passed": False}] * 6,
+                "gate": {"consecutive_passes": 0, "can_enable_oe": False},
+            }
+
+    sys.modules.pop("src.closed_loop_controller", None)
+    import src.closed_loop_controller as clc
+
+    monkeypatch.setattr(clc, "ClosedLoopArmController", FakeControllerConnectFailure)
+    sys.modules["src.closed_loop_controller"] = clc
+
+    rc = demo.main(["--port", "auto"])
+    report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert rc == 1
+    assert report["status"] == "ABORT_STEP_1"
+    assert report["connect_failure"] == {
+        "reason": "three_consecutive_passes_not_reached",
+        "audits_count": 6,
+        "gate": {"consecutive_passes": 0, "can_enable_oe": False},
+    }
+
+
 def test_sequence_order(monkeypatch, capsys):
     sys.modules.pop("src.closed_loop_controller", None)
     import src.closed_loop_controller as clc

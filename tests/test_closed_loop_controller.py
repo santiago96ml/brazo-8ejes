@@ -42,18 +42,27 @@ class FakeArm:
 
 
 class FakeEncoder:
-    def __init__(self, arm, audit_passes=True):
+    def __init__(self, arm, audit_passes=True, audit_sequence=None):
         self.arm = arm
         self.audit_passes = audit_passes
         self.mode_used = "aruco"
         self.thetas_override = None
+        self.audit_sequence = list(audit_sequence or [])
+        self.audit_calls = []
 
-    def audit_pre_power(self, _camera, **_kwargs):
+    def audit_pre_power(self, _camera, **kwargs):
+        self.audit_calls.append(kwargs)
+        if self.audit_sequence:
+            return self.audit_sequence.pop(0)
+        variance = 0.01 if self.audit_passes else 9.0
         return {
             "passed": self.audit_passes,
-            "mode_used": "aruco",
+            "mode_used": "aruco" if self.audit_passes else "geometric_fallback",
             "resting_thetas_deg": list(self.arm.thetas),
-            "max_variance_deg2": 0.01,
+            "frames_evaluated": 30,
+            "max_variance_deg2": variance,
+            "primary_max_variance_deg2": variance,
+            "secondary_max_variance_deg2": 0.0,
         }
 
     def read_positions(self, _frame):
@@ -85,13 +94,13 @@ class FakeTransport:
         self.closed = True
 
 
-def make_controller(*, audit_passes=True, **kwargs):
+def make_controller(*, audit_passes=True, audit_sequence=None, **kwargs):
     arm = FakeArm()
     camera = FakeCamera()
     transport = FakeTransport(arm)
     controller = ClosedLoopArmController(
         camera=camera,
-        encoder=FakeEncoder(arm, audit_passes=audit_passes),
+        encoder=FakeEncoder(arm, audit_passes=audit_passes, audit_sequence=audit_sequence),
         transport=transport,
         control_hz=kwargs.pop("control_hz", 200.0),
         **kwargs,
@@ -107,6 +116,68 @@ def test_connect_refuses_to_enable_when_pre_power_audit_fails():
     assert not result["ok"]
     assert "R" not in transport.commands
     assert transport.commands[-1] == "S"
+    assert result["reason"] == "three_consecutive_passes_not_reached"
+    assert len(result["audits"]) == 6
+
+
+def _audit(mode, variance, passed=True):
+    return {
+        "passed": passed,
+        "mode_used": mode,
+        "resting_thetas_deg": [15.0, 90.0, 0.0, 0.0, 0.0, 50.0],
+        "frames_evaluated": 30,
+        "max_variance_deg2": variance,
+        "primary_max_variance_deg2": variance,
+        "secondary_max_variance_deg2": 0.0,
+    }
+
+
+def test_connect_sliding_audit_window_recovers_after_first_failure():
+    sequence = [
+        _audit("geometric_fallback", 9.0, passed=False),
+        _audit("geometric_fallback", 0.33),
+        _audit("geometric_fallback", 0.4),
+        _audit("geometric_fallback", 0.5),
+    ]
+    controller, _arm, transport = make_controller(audit_sequence=sequence)
+
+    result = controller.connect()
+
+    assert result["ok"] is True
+    assert len(result["audits"]) == 4
+    assert result["variance_limit_deg2"] == 5.0
+    assert [call["max_variance_deg"] for call in controller.encoder.audit_calls] == [
+        5.0, 5.0, 5.0, 5.0
+    ]
+    assert "R" in transport.commands
+
+
+def test_connect_fails_after_six_audit_failures():
+    sequence = [_audit("geometric_fallback", 9.0, passed=False) for _ in range(6)]
+    controller, _arm, transport = make_controller(audit_sequence=sequence)
+
+    result = controller.connect()
+
+    assert result["ok"] is False
+    assert result["reason"] == "three_consecutive_passes_not_reached"
+    assert len(result["audits"]) == 6
+    assert result["gate"]["consecutive_passes"] == 0
+    assert "R" not in transport.commands
+    assert transport.commands[-1] == "S"
+
+
+def test_aruco_audit_above_mode_limit_is_rejected():
+    controller, _arm, transport = make_controller(
+        audit_sequence=[_audit("aruco", 3.0)],
+        max_audit_attempts=1,
+    )
+
+    result = controller.connect()
+
+    assert result["ok"] is False
+    assert result["audits"][0]["variance_limit_deg2"] == 1.5
+    assert controller.encoder.audit_calls[0]["max_variance_deg"] == 5.0
+    assert "R" not in transport.commands
 
 
 def test_connect_closes_when_fresh_valid_vision_is_unavailable():

@@ -115,8 +115,15 @@ def main(argv: List[str] | None = None) -> int:
         try:
             active_step_num = 1
             res = controller.connect()
+            connect_ok = bool(res.get("ok", res.get("status") == "OK"))
+            if not connect_ok:
+                report["connect_failure"] = {
+                    "reason": res.get("reason", "unknown"),
+                    "audits_count": len(res.get("audits", [])),
+                    "gate": res.get("gate"),
+                }
             log_step("connect", {
-                "ok": bool(res.get("ok", res.get("status") == "OK")),
+                "ok": connect_ok,
                 "error_deg": 0.0,
             })
             active_step_num = 2

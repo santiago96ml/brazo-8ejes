@@ -49,6 +49,8 @@ class ClosedLoopArmController:
         tolerance_deg: float = 2.5,
         max_iterations: int = 400,
         max_slew_counts_per_cycle: int = 12,
+        audit_max_variance: float | None = None,
+        max_audit_attempts: int = 6,
     ):
         if float(control_hz) <= 0:
             raise ValueError("control_hz must be greater than zero")
@@ -56,6 +58,12 @@ class ClosedLoopArmController:
             raise ValueError("max_iterations must be greater than zero")
         if int(max_slew_counts_per_cycle) <= 0:
             raise ValueError("max_slew_counts_per_cycle must be greater than zero")
+        if int(max_audit_attempts) <= 0:
+            raise ValueError("max_audit_attempts must be greater than zero")
+        if audit_max_variance is not None and (
+            not math.isfinite(float(audit_max_variance)) or float(audit_max_variance) <= 0
+        ):
+            raise ValueError("audit_max_variance must be a finite positive number")
 
         self.camera = camera
         self.encoder = encoder
@@ -66,6 +74,10 @@ class ClosedLoopArmController:
         self.tolerance_deg = float(tolerance_deg)
         self.max_iterations = int(max_iterations)
         self.max_slew_counts_per_cycle = int(max_slew_counts_per_cycle)
+        self.audit_max_variance = (
+            None if audit_max_variance is None else float(audit_max_variance)
+        )
+        self.max_audit_attempts = int(max_audit_attempts)
         self.odometry = PulseOdometry()
         self._controllers = self._build_controllers()
         self._decision_gate = DecisionGate(
@@ -168,30 +180,100 @@ class ClosedLoopArmController:
 
             self._decision_gate.reset()
             audits = []
-            for _ in range(self._decision_gate.required_consecutive_passes):
-                audit = self.encoder.audit_pre_power(
-                    self.camera,
-                    num_frames=30,
-                    max_variance_deg=None,
-                )
-                audits.append(audit)
-                gate = self._decision_gate.record_audit(audit)
-                if not gate["can_enable_oe"] and not audit.get("passed", False):
-                    self.stop()
-                    return {
-                        "ok": False,
-                        "reason": audit.get("reason", "pre_power_audit_failed"),
-                        "audits": audits,
-                        "gate": gate,
+            previous_mode = "none"
+            gate = {
+                "can_enable_oe": False,
+                "consecutive_passes": 0,
+                "oe_command": "S",
+            }
+            effective_limit = 1.5
+            limit_source = "auto_aruco"
+            for attempt in range(self.max_audit_attempts):
+                if self.audit_max_variance is not None:
+                    requested_limit = self.audit_max_variance
+                elif attempt == 0:
+                    requested_limit = 5.0
+                else:
+                    requested_limit = 5.0 if previous_mode == "geometric_fallback" else 1.5
+                try:
+                    audit = self.encoder.audit_pre_power(
+                        self.camera,
+                        num_frames=30,
+                        max_variance_deg=requested_limit,
+                    )
+                except Exception as exc:
+                    audit = {
+                        "passed": False,
+                        "max_variance_deg2": 999.0,
+                        "primary_max_variance_deg2": 999.0,
+                        "secondary_max_variance_deg2": 999.0,
+                        "frames_evaluated": 0,
+                        "mode_used": "none",
+                        "reason": f"error:{exc}",
                     }
 
-            if not gate["can_enable_oe"]:
+                mode = str(audit.get("mode_used", "none"))
+                previous_mode = mode
+                if self.audit_max_variance is not None:
+                    effective_limit = self.audit_max_variance
+                    limit_source = "explicit"
+                elif mode == "geometric_fallback":
+                    effective_limit = 5.0
+                    limit_source = "auto_geometric"
+                else:
+                    effective_limit = 1.5
+                    limit_source = "auto_aruco"
+
+                try:
+                    frames_evaluated = int(audit.get("frames_evaluated", 0))
+                    primary_variance = float(audit.get(
+                        "primary_max_variance_deg2",
+                        audit.get("max_variance_deg2", 999.0),
+                    ))
+                    secondary_variance = float(audit.get("secondary_max_variance_deg2", 0.0))
+                    if not math.isfinite(primary_variance):
+                        primary_variance = 999.0
+                    if not math.isfinite(secondary_variance):
+                        secondary_variance = 999.0
+                except (TypeError, ValueError):
+                    frames_evaluated = 0
+                    primary_variance = 999.0
+                    secondary_variance = 999.0
+
+                secondary_limit = max(1.5, effective_limit * 3.0)
+                variance_passed = (
+                    frames_evaluated > 0
+                    and primary_variance < effective_limit
+                    and secondary_variance < secondary_limit
+                )
+                # Preserve audit-specific checks when its own threshold was used;
+                # otherwise evaluate the measured variances against the detected mode.
+                if math.isclose(requested_limit, effective_limit):
+                    audit["passed"] = bool(audit.get("passed", variance_passed)) and variance_passed
+                else:
+                    audit["passed"] = variance_passed
+                audit["variance_limit_deg2"] = effective_limit
+                audit["variance_limit_source"] = limit_source
+                audit["requested_audit_limit_deg2"] = requested_limit
+                audits.append(audit)
+                gate = self._decision_gate.record_audit(audit)
+                if self._decision_gate.consecutive_passes >= self._decision_gate.required_consecutive_passes:
+                    break
+                if attempt + 1 < self.max_audit_attempts:
+                    set_oe_state = getattr(self.encoder, "set_oe_state", None)
+                    if callable(set_oe_state):
+                        set_oe_state(oe_high=True, active_command=False)
+                    time.sleep(0.35)
+
+            if self._decision_gate.consecutive_passes < self._decision_gate.required_consecutive_passes:
                 self.stop()
                 return {
                     "ok": False,
-                    "reason": "decision_gate_denied",
+                    "reason": "three_consecutive_passes_not_reached",
                     "audits": audits,
                     "gate": gate,
+                    "variance_limit_deg2": effective_limit,
+                    "variance_limit_source": limit_source,
                 }
 
             latest = self._get_frame()
@@ -218,6 +300,8 @@ class ClosedLoopArmController:
                 "reason": "enabled",
                 "audits": audits,
                 "gate": gate,
+                "variance_limit_deg2": effective_limit,
+                "variance_limit_source": limit_source,
                 "state": final_state,
             }
         except KeyboardInterrupt:
