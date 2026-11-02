@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import sys
 import time
+from types import SimpleNamespace
 
 from src.pulse_odometry import PulseOdometry
 from src.closed_loop_controller import ClosedLoopArmController
@@ -26,7 +29,7 @@ class FakeCamera:
 class FakeArm:
     def __init__(self):
         self.odometry = PulseOdometry()
-        self.thetas = [0.0, 90.0, 0.0, 0.0, 0.0, 50.0]
+        self.thetas = [15.0, 90.0, 0.0, 0.0, 0.0, 50.0]
 
     def apply_pulse(self, motor, pulse):
         motors = self.odometry.thetas_to_motors(self.thetas)
@@ -42,6 +45,8 @@ class FakeEncoder:
     def __init__(self, arm, audit_passes=True):
         self.arm = arm
         self.audit_passes = audit_passes
+        self.mode_used = "aruco"
+        self.thetas_override = None
 
     def audit_pre_power(self, _camera, **_kwargs):
         return {
@@ -54,8 +59,11 @@ class FakeEncoder:
     def read_positions(self, _frame):
         motors = self.arm.odometry.thetas_to_motors(self.arm.thetas)
         return {
-            "mode_used": "aruco",
-            "thetas_deg": list(self.arm.thetas),
+            "mode_used": self.mode_used,
+            "thetas_deg": (
+                list(self.thetas_override)
+                if self.thetas_override is not None else list(self.arm.thetas)
+            ),
             "motors_deg": motors,
             "omega_vis_dps": [0.0] * 6,
         }
@@ -65,6 +73,7 @@ class FakeTransport:
     def __init__(self, arm):
         self.arm = arm
         self.commands = []
+        self.closed = False
 
     def send_line(self, command):
         self.commands.append(command)
@@ -73,7 +82,7 @@ class FakeTransport:
             self.arm.apply_pulse(int(motor_text), int(pulse_text))
 
     def close(self):
-        pass
+        self.closed = True
 
 
 def make_controller(*, audit_passes=True, **kwargs):
@@ -98,6 +107,19 @@ def test_connect_refuses_to_enable_when_pre_power_audit_fails():
     assert not result["ok"]
     assert "R" not in transport.commands
     assert transport.commands[-1] == "S"
+
+
+def test_connect_closes_when_fresh_valid_vision_is_unavailable():
+    controller, _arm, transport = make_controller()
+    controller.encoder.thetas_override = [0.0, 90.0, 0.0, 0.0, 0.0, 50.0]
+
+    result = controller.connect()
+
+    assert result["ok"] is False
+    assert result["reason"] == "vision_unavailable"
+    assert "R" not in transport.commands
+    assert transport.commands[-1] == "S"
+    assert transport.closed
 
 
 def test_move_to_thetas_converges_on_simulated_two_joint_arm():
@@ -162,3 +184,93 @@ def test_stop_is_idempotent_and_always_sends_stop_command():
     controller.stop()
 
     assert transport.commands[-2:] == ["S", "S"]
+
+
+def test_read_state_rejects_missing_vision_and_default_pose_sentinel():
+    controller, _arm, _transport = make_controller()
+    encoder = controller.encoder
+    encoder.mode_used = "none"
+    none_state = controller.read_state(wait_fresh=False)
+    assert none_state["valid"] is False
+    assert none_state["source"] == "none"
+
+    encoder.mode_used = "aruco"
+    encoder.thetas_override = [0.0, 90.0, 0.0, 0.0, 0.0, 50.0]
+    sentinel_state = controller.read_state(wait_fresh=False)
+    assert sentinel_state["valid"] is False
+
+
+def test_invalid_pose_refuses_both_move_apis_without_pulse_commands():
+    controller, _arm, transport = make_controller()
+    assert controller.connect()["ok"]
+    controller.encoder.mode_used = "none"
+    command_start = len(transport.commands)
+
+    move = controller.move_to_thetas([20.0, 90.0, 0.0, 0.0, 0.0, 50.0], joint_mask=[0])
+    assert move["ok"] is False
+    assert move["reason"] == "invalid_start_pose"
+    assert not any(command.startswith(("P", "T")) for command in transport.commands[command_start:])
+
+    result = controller.move_joint(7, 5.0)
+    assert result["ok"] is False
+    assert result["reason"] == "invalid_start_pose"
+    assert not any(command.startswith(("P", "T")) for command in transport.commands[command_start:])
+
+
+def test_return_to_start_converges_on_simulated_arm():
+    controller, arm, _transport = make_controller()
+    initial_thetas = list(arm.thetas)
+    assert controller.connect()["ok"]
+    assert controller.start_thetas_deg == initial_thetas
+
+    moved = list(arm.thetas)
+    moved[1] = 100.0
+    assert controller.move_to_thetas(moved, joint_mask=[1], timeout_s=3.0)["ok"]
+
+    result = controller.return_to_start(timeout_s=3.0)
+
+    assert result["ok"] is True
+    assert abs(arm.thetas[1] - controller.start_thetas_deg[1]) <= controller.tolerance_deg
+
+
+def test_autonomous_demo_restores_start_after_step_three_failure(monkeypatch, capsys):
+    class FailingController:
+        def __init__(self, **_kwargs):
+            self.return_calls = 0
+
+        def connect(self):
+            return {"ok": True}
+
+        def read_state(self, **_kwargs):
+            return {"valid": True, "thetas_deg": [20.0, 90.0, 0.0, 0.0, 0.0, 50.0]}
+
+        def move_to_thetas(self, *_args, **_kwargs):
+            return {"ok": False, "reason": "simulated_failure"}
+
+        def move_joint(self, *_args, **_kwargs):
+            return {"ok": True}
+
+        def return_to_start(self, timeout_s=6.0):
+            self.return_calls += 1
+            assert timeout_s <= 6.0
+            return {"ok": True, "final_error_deg": [0.0] * 6}
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    controller = FailingController()
+    module = SimpleNamespace(ClosedLoopArmController=lambda **_kwargs: controller)
+    monkeypatch.setitem(sys.modules, "src.closed_loop_controller", module)
+
+    from tools import autonomous_demo
+
+    status = autonomous_demo.main([])
+    report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert status == 1
+    assert report["status"] == "ABORT_STEP_3"
+    assert report["return_to_start"] == {"ok": True, "final_error_deg": [0.0] * 6}
+    assert controller.return_calls == 1

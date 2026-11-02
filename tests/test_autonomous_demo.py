@@ -13,12 +13,17 @@ class FakeControllerOK:
         self.stopped = False
         self.closed = False
         self.moves = []
+        self.return_calls = 0
 
     def connect(self):
         return {"ok": True}
 
-    def read_state(self):
-        return {"thetas_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 50.0]}
+    def read_state(self, **_kwargs):
+        return {
+            "valid": True,
+            "source": "fake",
+            "thetas_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 50.0],
+        }
 
     def move_to_thetas(self, target_thetas_deg, tolerance_deg=None, timeout_s=10.0, joint_mask=None):
         self.moves.append(list(target_thetas_deg))
@@ -30,6 +35,10 @@ class FakeControllerOK:
     def hold(self, seconds):
         pass
 
+    def return_to_start(self, timeout_s=6.0):
+        self.return_calls += 1
+        return {"ok": True, "final_error_deg": [0.0] * 6}
+
     def stop(self):
         self.stopped = True
 
@@ -40,7 +49,7 @@ class FakeControllerOK:
 class FakeControllerFailStep3(FakeControllerOK):
     def move_to_thetas(self, target_thetas_deg, tolerance_deg=None, timeout_s=10.0, joint_mask=None):
         self.moves.append(list(target_thetas_deg))
-        if len(self.moves) == 4:  # fail on 4th move
+        if len(self.moves) == 1:  # fail on the first move in step 3
             return {"ok": False, "error_deg": 2.5}
         return {"ok": True, "error_deg": 0.0}
 
@@ -70,6 +79,7 @@ def test_fail_on_step3_calls_stop(monkeypatch, capsys):
     lines = [l for l in out.strip().splitlines() if l.strip()]
     report = json.loads(lines[-1])
     assert report["status"] == "ABORT_STEP_3"
+    assert report["return_to_start"] == {"ok": True, "final_error_deg": [0.0] * 6}
     # Check stop was called
     assert any("STEP" in l for l in lines)
 

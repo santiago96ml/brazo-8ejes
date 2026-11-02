@@ -45,13 +45,20 @@ def main(argv: List[str] | None = None) -> int:
                     return {"status": "OK"}
 
                 def read_state(self):
-                    return {"thetas_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 50.0]}
+                    return {
+                        "valid": True,
+                        "source": "dry_run",
+                        "thetas_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 50.0],
+                    }
 
                 def move_to_thetas(self, target_thetas_deg, tolerance_deg=None, timeout_s=10.0, joint_mask=None):
                     return {"ok": True, "error_deg": 0.0}
 
                 def move_joint(self, motor, delta_deg, timeout_s=6.0):
                     return {"ok": True, "error_deg": 0.0}
+
+                def return_to_start(self, timeout_s=6.0):
+                    return {"ok": True, "final_error_deg": [0.0] * 6}
 
                 def hold(self, seconds):
                     pass
@@ -91,10 +98,12 @@ def main(argv: List[str] | None = None) -> int:
         controller = ClosedLoopArmController(camera=args.camera, port=args.port)
         total_steps = 7
         step_num = 0
+        active_step_num = 0
 
         def log_step(name: str, result: Dict[str, Any]):
-            nonlocal step_num
+            nonlocal step_num, active_step_num
             step_num += 1
+            active_step_num = step_num
             ok = bool(result.get("ok", True))
             err = float(result.get("error_deg", 0.0))
             status = "ok" if ok else "fail"
@@ -104,9 +113,16 @@ def main(argv: List[str] | None = None) -> int:
                 raise RuntimeError(f"Step {name} failed")
 
         try:
+            active_step_num = 1
             res = controller.connect()
-            log_step("connect", {"ok": True, "error_deg": 0.0})
-            state = controller.read_state()
+            log_step("connect", {
+                "ok": bool(res.get("ok", res.get("status") == "OK")),
+                "error_deg": 0.0,
+            })
+            active_step_num = 2
+            state = controller.read_state(wait_fresh=True, timeout_s=1.5)
+            if not state.get("valid", False):
+                raise RuntimeError("invalid_start_pose")
             start = list(state.get("thetas_deg", [0.0] * 6))
             report["start_thetas"] = start
             current = list(start)
@@ -115,6 +131,7 @@ def main(argv: List[str] | None = None) -> int:
             log_step("read start pose", {"ok": True, "error_deg": 0.0})
 
             # Step 3: Base sweep: +15°, then -15°, back to start
+            active_step_num = 3
             current[0] = start[0] + 15.0
             r = controller.move_to_thetas(current)
             if not r.get("ok", True):
@@ -130,6 +147,7 @@ def main(argv: List[str] | None = None) -> int:
             log_step("base sweep +15/-15 back", {"ok": True, "error_deg": 0.0})
 
             # Step 4: Shoulder lift: +12° then back
+            active_step_num = 4
             current[1] = start[1] + 12.0
             current[2] = start[2] + 12.0  # coupled
             r = controller.move_to_thetas(current)
@@ -143,6 +161,7 @@ def main(argv: List[str] | None = None) -> int:
             log_step("shoulder lift +12 back", {"ok": True, "error_deg": 0.0})
 
             # Step 5: Elbow: +12° then back
+            active_step_num = 5
             current[2] = start[2] + 12.0
             r = controller.move_to_thetas(current)
             if not r.get("ok", True):
@@ -154,6 +173,7 @@ def main(argv: List[str] | None = None) -> int:
             log_step("elbow +12 back", {"ok": True, "error_deg": 0.0})
 
             # Step 6: Gripper salute: 100 → 0 → 50
+            active_step_num = 6
             current[5] = 100.0
             r = controller.move_to_thetas(current)
             if not r.get("ok", True):
@@ -169,6 +189,7 @@ def main(argv: List[str] | None = None) -> int:
             log_step("gripper salute 100->0->50", {"ok": True, "error_deg": 0.0})
 
             # Step 7: Return to the exact start pose
+            active_step_num = 7
             r = controller.move_to_thetas(start)
             if not r.get("ok", True):
                 raise RuntimeError("fail")
@@ -180,8 +201,36 @@ def main(argv: List[str] | None = None) -> int:
             report["status"] = "OK"
             print(json.dumps(report))
             return 0
-        except Exception as e:
-            report["status"] = f"ABORT_STEP_{step_num}"
+        except KeyboardInterrupt:
+            report["status"] = f"ABORT_STEP_{active_step_num or step_num}"
+            try:
+                if controller is not None:
+                    result = controller.return_to_start(timeout_s=6.0)
+                    report["return_to_start"] = {
+                        "ok": bool(result.get("ok", False)),
+                        "final_error_deg": result.get("final_error_deg", []),
+                    }
+            except Exception:
+                report["return_to_start"] = {"ok": False, "final_error_deg": []}
+            try:
+                if controller is not None:
+                    controller.stop()
+            except Exception:
+                pass
+            report["duration_s"] = time.time() - start_time
+            print(json.dumps(report))
+            return 1
+        except Exception:
+            report["status"] = f"ABORT_STEP_{active_step_num or step_num}"
+            try:
+                if controller is not None:
+                    result = controller.return_to_start(timeout_s=6.0)
+                    report["return_to_start"] = {
+                        "ok": bool(result.get("ok", False)),
+                        "final_error_deg": result.get("final_error_deg", []),
+                    }
+            except Exception:
+                report["return_to_start"] = {"ok": False, "final_error_deg": []}
             try:
                 if controller is not None:
                     controller.stop()

@@ -79,6 +79,8 @@ class ClosedLoopArmController:
         self._vision_none_since: float | None = None
         self._last_mode_used = "none"
         self._last_omega = [0.0] * 6
+        self._last_frame_timestamp = None
+        self.start_thetas_deg: list[float] | None = None
         self._last_sent_pulses = {
             motor: int(round(float(self.odometry._calib[motor]["pulse_stop"])))
             for motor in range(1, 8)
@@ -114,12 +116,13 @@ class ClosedLoopArmController:
         return controllers
 
     def _ensure_components(self) -> None:
-        if self.camera is None:
+        if self.camera is None or isinstance(self.camera, int):
             try:
                 from .fast_camera import FastUSBCamera
             except ImportError:  # pragma: no cover
                 from fast_camera import FastUSBCamera
-            self.camera = FastUSBCamera()
+            index = 0 if self.camera is None else self.camera
+            self.camera = FastUSBCamera(index=index)
         if self.encoder is None:
             try:
                 from .virtual_optical_encoder import VirtualOpticalEncoder
@@ -191,15 +194,32 @@ class ClosedLoopArmController:
                     "gate": gate,
                 }
 
-            thetas = audits[-1].get("resting_thetas_deg")
-            if not isinstance(thetas, (list, tuple)) or len(thetas) < 6:
-                state = self.read_state()
-                thetas = state["thetas_deg"]
-            self._preload_pulses([float(value) for value in thetas[:6]])
+            latest = self._get_frame()
+            self._last_frame_timestamp = latest[1] if latest[0] is not None else None
+            state = self.read_state(wait_fresh=True, timeout_s=1.5)
+            if not state["valid"]:
+                self.stop()
+                self.close()
+                return {"ok": False, "reason": "vision_unavailable", "audits": audits}
+            self.start_thetas_deg = list(state["thetas_deg"])
+            self._preload_pulses(self.start_thetas_deg)
             self._send("R")
             self._connected = True
             self._enabled = True
-            return {"ok": True, "reason": "enabled", "audits": audits, "gate": gate}
+            latest = self._get_frame()
+            self._last_frame_timestamp = latest[1] if latest[0] is not None else None
+            final_state = self.read_state(wait_fresh=True, timeout_s=1.5)
+            if not final_state["valid"]:
+                self.stop()
+                self.close()
+                return {"ok": False, "reason": "vision_unavailable", "audits": audits}
+            return {
+                "ok": True,
+                "reason": "enabled",
+                "audits": audits,
+                "gate": gate,
+                "state": final_state,
+            }
         except KeyboardInterrupt:
             self.stop()
             return {"ok": False, "reason": "keyboard_interrupt"}
@@ -209,34 +229,26 @@ class ClosedLoopArmController:
 
     def _get_frame(self):
         if self.camera is None:
-            return None
+            return None, None
         getter = getattr(self.camera, "get_latest_frame", None)
         if callable(getter):
             value = getter()
             if isinstance(value, tuple):
-                return value[0]
-            return value
+                frame = value[0] if value else None
+                timestamp = value[1] if len(value) > 1 else None
+                return frame, timestamp
+            return value, time.monotonic_ns()
         reader = getattr(self.camera, "read", None)
         if callable(reader):
             value = reader()
             if isinstance(value, tuple) and len(value) == 2:
-                return value[1] if value[0] else None
-            return value
-        return None
+                return (value[1] if value[0] else None), time.monotonic_ns()
+            return value, time.monotonic_ns()
+        return None, None
 
-    def read_state(self) -> dict:
-        timestamp = time.time()
-        frame = self._get_frame()
-        if frame is None:
+    def _state_from_result(self, result: dict, timestamp: float) -> dict:
+        if not isinstance(result, dict):
             result = {"mode_used": "none"}
-        else:
-            try:
-                result = self.encoder.read_positions(frame, timestamp_s=timestamp)
-            except TypeError:
-                result = self.encoder.read_positions(frame)
-            except Exception:
-                result = {"mode_used": "none"}
-
         mode = str(result.get("mode_used", "none"))
         now = time.monotonic()
         if mode == "none":
@@ -246,16 +258,25 @@ class ClosedLoopArmController:
             self._vision_none_since = None
         self._last_mode_used = mode
 
-        raw_thetas = result.get("thetas_deg", _DEFAULT_THETAS)
-        try:
-            thetas = [float(value) for value in raw_thetas[:6]]
-        except (TypeError, ValueError):
-            thetas = list(_DEFAULT_THETAS)
-        if len(thetas) < 6 or not all(math.isfinite(value) for value in thetas):
-            thetas = list(_DEFAULT_THETAS)
+        raw_thetas = result.get("thetas_deg")
+        thetas: list[float] = []
+        if isinstance(raw_thetas, (list, tuple)):
+            try:
+                thetas = [float(value) for value in raw_thetas[:6]]
+            except (TypeError, ValueError):
+                thetas = []
+        valid = (
+            mode != "none"
+            and len(thetas) == 6
+            and all(math.isfinite(value) for value in thetas)
+            and not all(abs(value - sentinel) <= 0.01
+                        for value, sentinel in zip(thetas, _DEFAULT_THETAS))
+        )
 
         motors = result.get("motors_deg")
-        if not isinstance(motors, dict):
+        if not valid:
+            motors = {}
+        elif not isinstance(motors, dict):
             motors = self.odometry.thetas_to_motors(thetas)
         else:
             motors = {int(motor): float(value) for motor, value in motors.items()}
@@ -272,7 +293,43 @@ class ClosedLoopArmController:
             "motors_deg": motors,
             "pulses": dict(self._last_sent_pulses),
             "timestamp": timestamp,
+            "valid": bool(valid),
+            "source": str(result.get("source") or mode),
         }
+
+    def read_state(self, wait_fresh: bool = True, timeout_s: float = 0.6) -> dict:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        last_state = None
+        while True:
+            frame, frame_timestamp = self._get_frame()
+            if frame is not None:
+                fresh = (
+                    not wait_fresh
+                    or frame_timestamp is None
+                    or frame_timestamp != self._last_frame_timestamp
+                )
+                if fresh:
+                    if frame_timestamp is not None:
+                        self._last_frame_timestamp = frame_timestamp
+                    try:
+                        try:
+                            result = self.encoder.read_positions(frame, timestamp_s=time.time())
+                        except TypeError:
+                            result = self.encoder.read_positions(frame)
+                    except Exception:
+                        result = {"mode_used": "none"}
+                    last_state = self._state_from_result(result, time.time())
+                    if last_state["valid"] or not wait_fresh:
+                        return last_state
+            elif not wait_fresh:
+                return self._state_from_result({"mode_used": "none"}, time.time())
+
+            remaining = deadline - time.monotonic()
+            if not wait_fresh or remaining <= 0:
+                return last_state or self._state_from_result(
+                    {"mode_used": "none"}, time.time()
+                )
+            time.sleep(min(0.01, remaining))
 
     @staticmethod
     def _normalize_joint_mask(joint_mask) -> list[int]:
@@ -381,6 +438,9 @@ class ClosedLoopArmController:
             while iterations < self.max_iterations:
                 cycle_start = time.monotonic()
                 state = self.read_state()
+                if not state["valid"]:
+                    self.stop()
+                    return self._result(False, "invalid_start_pose", iterations, start, errors)
                 if (self._vision_none_since is not None
                         and cycle_start - self._vision_none_since > 0.5):
                     self.stop()
@@ -419,6 +479,10 @@ class ClosedLoopArmController:
             start = time.monotonic()
             return self._result(False, "unsupported_motor", 0, start, [0.0] * 6)
         state = self.read_state()
+        if not state["valid"]:
+            start = time.monotonic()
+            self.stop()
+            return self._result(False, "invalid_start_pose", 0, start, [0.0] * 6)
         index = _MOTOR_TO_THETA[int(motor)]
         targets = list(state["thetas_deg"])
         targets[index] += float(delta_deg)
@@ -426,6 +490,34 @@ class ClosedLoopArmController:
             targets,
             timeout_s=timeout_s,
             joint_mask=[index],
+        )
+
+    def return_to_start(self, timeout_s: float = 6.0) -> dict:
+        """Safely re-enable from the measured pose and return to the connect pose."""
+        started = time.monotonic()
+        timeout = max(0.0, float(timeout_s))
+        deadline = started + timeout
+        errors = [0.0] * 6
+        if self.start_thetas_deg is None:
+            return self._result(False, "invalid_start_pose", 0, started, errors)
+        if not self._connected or self.transport is None:
+            return self._result(False, "not_connected", 0, started, errors)
+        if not self._enabled:
+            state = self.read_state(
+                wait_fresh=True,
+                timeout_s=min(0.6, max(0.0, deadline - time.monotonic())),
+            )
+            if not state["valid"]:
+                return self._result(False, "invalid_start_pose", 0, started, errors)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._result(False, "timeout", 0, started, errors)
+            self._preload_pulses(state["thetas_deg"])
+            self._send("R")
+            self._enabled = True
+        return self.move_to_thetas(
+            self.start_thetas_deg,
+            timeout_s=max(0.0, deadline - time.monotonic()),
         )
 
     def hold(self, seconds: float) -> dict:
@@ -456,7 +548,6 @@ class ClosedLoopArmController:
     def stop(self) -> dict:
         """Always attempt the firmware emergency-stop command."""
         self._enabled = False
-        self._connected = False
         try:
             self._send("S")
             return {"ok": True, "command": "S"}
@@ -465,6 +556,7 @@ class ClosedLoopArmController:
 
     def close(self) -> None:
         self.stop()
+        self._connected = False
         if self._camera_started and self.camera is not None:
             try:
                 self.camera.stop()
