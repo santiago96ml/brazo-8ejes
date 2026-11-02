@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +20,9 @@ import numpy as np
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+
+_ACTIVE_SERIAL_TRANSPORTS: dict[str, Any] = {}
+_SERIAL_PORT_LOCK = threading.RLock()
 
 # --- optional imports (robust to different invocation styles) ---
 try:
@@ -155,10 +159,52 @@ class AgentController:
                 try:
                     import serial  # noqa
                     from host.armctl.transport import SerialTransport  # type: ignore
-                    self.transport = SerialTransport(detected, 115200)
+                    port_key = str(detected).upper()
+                    with _SERIAL_PORT_LOCK:
+                        existing = _ACTIVE_SERIAL_TRANSPORTS.get(port_key)
+                        if existing is not None:
+                            try:
+                                if hasattr(existing, "close"):
+                                    existing.close()
+                            except Exception:
+                                pass
+                            _ACTIVE_SERIAL_TRANSPORTS.pop(port_key, None)
+                        self.transport = SerialTransport(detected, 115200)
+                        _ACTIVE_SERIAL_TRANSPORTS[port_key] = self.transport
                 except Exception:
                     self.sim = True
                     self.transport = SimulatedTransport()
+
+    def close(self):
+        try:
+            transport = getattr(self, "transport", None)
+            if transport is not None:
+                try:
+                    if hasattr(transport, "close"):
+                        transport.close()
+                except Exception:
+                    pass
+                if not getattr(self, "sim", False):
+                    port_key = str(getattr(self, "port", "") or "").upper()
+                    if not port_key and transport is not None:
+                        try:
+                            p = getattr(transport, "port", None)
+                            if p:
+                                port_key = str(p).upper()
+                        except Exception:
+                            pass
+                    if port_key:
+                        with _SERIAL_PORT_LOCK:
+                            if _ACTIVE_SERIAL_TRANSPORTS.get(port_key) is transport:
+                                _ACTIVE_SERIAL_TRANSPORTS.pop(port_key, None)
+        finally:
+            self.transport = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
 
     # ---------- helpers ----------
     def _state_dict(self) -> Dict[str, Any]:

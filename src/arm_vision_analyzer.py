@@ -176,6 +176,10 @@ class ArmVisionAnalyzer:
         self._kp_history = []
         self._prev_mask_centroid = None
         self._link_lengths_mm = None
+        self._prev_theta1 = None
+        self._camera_tilt_deg = 0.0
+        self._turntable_ellipse_ratio = 0.0
+        self._camera_tilt_optimal = False
 
     def _load_link_lengths(self) -> dict:
         """Load the physical link lengths once, with the audited arm as fallback."""
@@ -240,18 +244,11 @@ class ArmVisionAnalyzer:
         try:
             import json
 
-            candidates = []
-            candidates.append(os.path.join(os.getcwd(), "config", "config_geometria.json"))
-            candidates.append(os.path.join(os.getcwd(), "config_geometria.json"))
-            here = os.path.dirname(os.path.abspath(__file__))
-            parent = os.path.dirname(here)
-            for p in ("config/config_geometria.json", "config_geometria.json"):
-                candidates.append(os.path.join(parent, p))
-            for c in candidates:
-                if os.path.exists(c):
-                    with open(c, "r", encoding="utf-8") as f:
-                        cfg = json.load(f)
-                    return cfg.get("joint_limits_deg", {}) or {}
+            path = os.path.join(REPO_ROOT, "config", "config_geometria.json")
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                return cfg.get("joint_limits_deg", {}) or {}
         except Exception:
             pass
         return {}
@@ -521,6 +518,154 @@ class ArmVisionAnalyzer:
         self._prev_keypoints_px = current_points
         return smoothed
 
+    def _estimate_base_theta1_bev(self, frame, sel_mask, pts_dict, link_lengths):
+        """Estimate base yaw (theta1) from a ~45 deg BEV projection.
+
+        Also computes and stores camera tilt / turntable ellipse metrics.
+        Returns theta1 in degrees [0, 360).
+        """
+        try:
+            if cv2 is None or np is None:
+                return 0.0
+            mask = np.asarray(sel_mask)
+            if mask.ndim != 2 or mask.size == 0:
+                return 0.0
+            h, w = mask.shape[:2]
+
+            # shoulder_y from pts_dict (best effort)
+            shoulder_pt = None
+            if isinstance(pts_dict, dict):
+                for key in ("shoulder",):
+                    v = pts_dict.get(key)
+                    if v is not None:
+                        shoulder_pt = v
+            shoulder_y = None
+            if shoulder_pt is not None:
+                try:
+                    shoulder_y = float(shoulder_pt[1])
+                except Exception:
+                    shoulder_y = None
+            if shoulder_y is None:
+                ys_all, _ = np.where(mask > 0)
+                shoulder_y = float(ys_all.min()) if ys_all.size else float(h * 0.5)
+
+            lower_y0 = max(0, int(math.floor(shoulder_y - 20.0)))
+            lower_region = mask[lower_y0:h, :]
+            ys_l, xs_l = np.where(lower_region > 0)
+            # fallback to whole mask if lower region empty
+            if xs_l.size < 5:
+                ys_l, xs_l = np.where(mask > 0)
+            if xs_l.size == 0:
+                a = 1.0
+                b = 1.0
+            else:
+                a = float(xs_l.max() - xs_l.min())
+                b = float(ys_l.max() - ys_l.min())
+                if a < 1.0:
+                    a = 1.0
+                if b < 1.0:
+                    b = 1.0
+            ratio_b_a = float(np.clip(b / max(a, 1.0), 0.05, 1.0))
+            theta_cam_deg = float(math.degrees(math.asin(ratio_b_a)))
+            camera_tilt_optimal = bool(35.0 <= theta_cam_deg <= 55.0)
+
+            self._camera_tilt_deg = theta_cam_deg
+            self._turntable_ellipse_ratio = ratio_b_a
+            self._camera_tilt_optimal = camera_tilt_optimal
+
+            # blue area + arched detection
+            blue_area = int(cv2.countNonZero(mask))
+            is_arched = False
+            try:
+                bx, by, bw, bh = cv2.boundingRect(mask)
+                apex_height = max(12, int(0.15 * bh))
+                top_y1 = min(by + apex_height, by + bh)
+                # centroid of top slice
+                moments = cv2.moments(mask[by:top_y1, bx:bx + bw], binaryImage=True)
+                if moments["m00"] > 0:
+                    ax = float(bx + moments["m10"] / moments["m00"])
+                    ay = float(by + moments["m01"] / moments["m00"])
+                    slice_y0 = by + int(0.35 * bh)
+                    slice_y1 = min(by + int(0.85 * bh), by + bh)
+                    split_x = min(max(int(ax), bx), bx + bw)
+                    middle_slice = mask[slice_y0:slice_y1, bx:bx + bw]
+                    left_area = int(cv2.countNonZero(middle_slice[:, :split_x - bx]))
+                    right_area = int(cv2.countNonZero(middle_slice[:, split_x - bx:]))
+                    is_arched = left_area > 800 and right_area > 800
+            except Exception:
+                is_arched = False
+
+            # synthetic straight-line keep 0
+            if (not is_arched) and blue_area < 25000:
+                smoothed = 0.0
+                self._prev_theta1 = 0.0
+                return 0.0
+
+            # points
+            def _pt(name):
+                if not isinstance(pts_dict, dict):
+                    return None
+                v = pts_dict.get(name)
+                if v is None:
+                    return None
+                try:
+                    return (float(v[0]), float(v[1]))
+                except Exception:
+                    return None
+
+            base = _pt("base")
+            shoulder = _pt("shoulder")
+            elbow = _pt("elbow")
+            wrist = _pt("wrist_pitch")
+            if base is None or shoulder is None or elbow is None:
+                return float(self._prev_theta1 if self._prev_theta1 is not None else 0.0)
+
+            L2 = float(link_lengths.get("L2", 145.0)) if isinstance(link_lengths, dict) else 145.0
+            L3 = float(link_lengths.get("L3", 135.0)) if isinstance(link_lengths, dict) else 135.0
+            d2_px = float(math.hypot(elbow[0] - shoulder[0], elbow[1] - shoulder[1]))
+            d3_px = 0.0
+            if wrist is not None:
+                d3_px = float(math.hypot(wrist[0] - elbow[0], wrist[1] - elbow[1]))
+            if L2 <= 0:
+                L2 = 145.0
+            if L3 <= 0:
+                L3 = 135.0
+
+            denom = a / 160.0
+            if denom <= 0:
+                denom = 1.0 / 160.0
+            gamma = (d2_px / L2) / denom
+            gamma = float(np.clip(gamma, 0.0, 1.0))
+
+            # BEV ground-plane vector base -> elbow
+            dx = float(elbow[0] - base[0])
+            dy = float(elbow[1] - base[1])
+            sin_cam = math.sin(math.radians(theta_cam_deg))
+            sy = max(sin_cam, 0.35)
+            dx_bev = dx
+            dy_bev = dy / sy
+            # incorporate foreshortening gamma into horizontal component
+            if gamma > 1e-6:
+                dx_bev = dx_bev / max(gamma, 0.1)
+            raw_rad = math.atan2(-dy_bev, dx_bev)
+            raw_deg = float(math.degrees(raw_rad)) % 360.0
+
+            # smooth with prev_theta1
+            alpha = 0.15
+            prev = self._prev_theta1
+            if prev is None:
+                smoothed = raw_deg
+            else:
+                pr = math.radians(float(prev))
+                rr = math.radians(raw_deg)
+                x = (1.0 - alpha) * math.cos(pr) + alpha * math.cos(rr)
+                y = (1.0 - alpha) * math.sin(pr) + alpha * math.sin(rr)
+                smoothed = float(math.degrees(math.atan2(y, x))) % 360.0
+            self._prev_theta1 = smoothed
+            return float(smoothed)
+        except Exception:
+            return float(self._prev_theta1 if getattr(self, "_prev_theta1", None) is not None else 0.0)
+
     def _geometric(self, frame):
         if cv2 is None or np is None:
             return None
@@ -695,9 +840,16 @@ class ArmVisionAnalyzer:
         except Exception:
             mask_centroid = None
         kp = self._smooth_keypoints(kp, mask_centroid)
+        link_lengths = self._load_link_lengths()
+        try:
+            theta1_bev = self._estimate_base_theta1_bev(frame, sel_mask, kp, link_lengths)
+        except Exception:
+            theta1_bev = 0.0
         thetas = self._derive_angles(kp)
         if thetas is None:
             return None
+        if isinstance(thetas, list) and len(thetas) >= 1:
+            thetas[0] = float(theta1_bev)
         if is_arch:
             thetas[4] = theta5
         thetas = self._clamp(thetas)
@@ -735,7 +887,13 @@ class ArmVisionAnalyzer:
             "T_0_6": None,
             "confidence": 0.0,
             "latency_ms": float(latency),
-            "debug": {"blue_area_px": int(blue_area), "joints_detected": 0},
+            "debug": {
+                "blue_area_px": int(blue_area),
+                "joints_detected": 0,
+                "camera_tilt_deg": round(float(getattr(self, "_camera_tilt_deg", 0.0)), 2),
+                "turntable_ellipse_ratio": round(float(getattr(self, "_turntable_ellipse_ratio", 0.0)), 4),
+                "camera_tilt_optimal": bool(getattr(self, "_camera_tilt_optimal", False)),
+            },
         }
 
     def analyze(self, frame_bgr):
@@ -857,7 +1015,13 @@ class ArmVisionAnalyzer:
                 "T_0_6": T,
                 "confidence": float(conf),
                 "latency_ms": float(latency),
-                "debug": {"blue_area_px": int(blue_area), "joints_detected": int(joints)},
+                "debug": {
+                    "blue_area_px": int(blue_area),
+                    "joints_detected": int(joints),
+                    "camera_tilt_deg": round(float(getattr(self, "_camera_tilt_deg", 0.0)), 2),
+                    "turntable_ellipse_ratio": round(float(getattr(self, "_turntable_ellipse_ratio", 0.0)), 4),
+                    "camera_tilt_optimal": bool(getattr(self, "_camera_tilt_optimal", False)),
+                },
             }
         except Exception:
             return self._none_result(t0, 0)

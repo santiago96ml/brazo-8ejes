@@ -13,17 +13,20 @@ TowerPro MG946R servos over USB serial, with an optional ESP32/ESP32-C3 WiFi bri
 ## Repository layout
 
 ```text
-firmware/mega2560_arm/   Arduino sketch (motor numbering 1..7 + AUX)
-firmware/esp32_bridge/   WiFi <-> UART1 transparent bridge
-host/armctl/             Python controller and CLI
-host/tests/              unittest suite, runs without hardware
-config/                  joints, pulse ranges, poses
-examples/                script sequences
-tools/arduino.ps1        build / upload / doctor wrapper around arduino-cli
-tools/armctl.ps1         runs the CLI with the right PYTHONPATH
-docs/                    wiring, protocol, calibration
-odd/tasks/               feature specification and decision log
+firmware_mega/            Official canonical firmware (v2.1.0) — flashed to COM4
+firmware/mega2560_arm/    Alternative sketch (motor numbering 1..7 + AUX)
+firmware/esp32_bridge/    WiFi <-> UART1 transparent bridge
+host/armctl/              Python controller and CLI
+host/tests/               unittest suite, runs without hardware
+config/                   joints, pulse ranges, poses
+examples/                 script sequences
+tools/arduino.ps1         build / upload / doctor wrapper around arduino-cli
+tools/armctl.ps1          runs the CLI with the right PYTHONPATH
+docs/                     wiring, protocol, calibration
+odd/tasks/                feature specification and decision log
 ```
+
+**Note:** `firmware_mega/firmware_mega.ino` (v2.1.0) is the **official canonical firmware binary** flashed to `COM4`. The `firmware/mega2560_arm/` variant uses a different modular structure and may not implement all commands (`Z`, `G`, `U`, etc.) supported by the canonical firmware. Both share the core protocol contract (`I`, `S`, `R`, `Q`, `Z`, `G`, `T`, `C`, `U`, `J6`, `E`, `V`, `F`).
 
 ## Quick start
 

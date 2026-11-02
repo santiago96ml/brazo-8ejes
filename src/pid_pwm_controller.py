@@ -267,6 +267,97 @@ def unpack_binary_frame(frame: bytes) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+class DecisionGate:
+    """Require stable audits and provide a bounded optical probe pulse."""
+
+    def __init__(self, max_audit_variance_deg2: float = 1.5,
+                 required_consecutive_passes: int = 3,
+                 probe_uncertainty_threshold_deg2: float = 0.15,
+                 probe_duration_ms: int = 40,
+                 probe_step_deg: float = 1.0):
+        self.max_audit_variance_deg2 = float(max_audit_variance_deg2)
+        self.required_consecutive_passes = max(1, int(required_consecutive_passes))
+        self.probe_uncertainty_threshold_deg2 = float(probe_uncertainty_threshold_deg2)
+        self.probe_duration_ms = int(probe_duration_ms)
+        self.probe_step_deg = float(probe_step_deg)
+        self.consecutive_passes = 0
+
+    def record_audit(self, audit_or_frame_result: dict) -> dict:
+        passed = audit_or_frame_result.get("passed")
+        if passed is None:
+            variance = audit_or_frame_result.get("max_variance_deg2")
+            passed = (variance is not None
+                      and float(variance) < self.max_audit_variance_deg2)
+        if bool(passed):
+            self.consecutive_passes += 1
+        else:
+            self.consecutive_passes = 0
+        can_enable_oe = self.consecutive_passes >= self.required_consecutive_passes
+        return {
+            "can_enable_oe": can_enable_oe,
+            "consecutive_passes": self.consecutive_passes,
+            "oe_command": "R" if can_enable_oe else "S",
+        }
+
+    def reset(self) -> None:
+        self.consecutive_passes = 0
+
+    def needs_probe_pulse(self, joint_variance_deg2: float) -> bool:
+        variance = float(joint_variance_deg2)
+        return (self.probe_uncertainty_threshold_deg2 <= variance
+                < self.max_audit_variance_deg2)
+
+    def build_probe_pulse(self, motor: int, direction: int = 1,
+                          pulse_odometry: Optional[Any] = None,
+                          current_deg: float = 90.0) -> dict:
+        signed_direction = 1 if direction >= 0 else -1
+        odometry = pulse_odometry
+        if odometry is None:
+            try:
+                from src.pulse_odometry import PulseOdometry
+            except ImportError:
+                from pulse_odometry import PulseOdometry  # type: ignore
+            odometry = PulseOdometry()
+
+        pulse = None
+        offset = None
+        try:
+            current_pulse = int(odometry.deg_to_pulse(motor, float(current_deg)))
+            target_position_pulse = int(odometry.deg_to_pulse(
+                motor, float(current_deg) + signed_direction * self.probe_step_deg
+            ))
+            calibration = getattr(odometry, "_calib", {}).get(motor, {})
+            stop = int(round(float(calibration.get("pulse_stop", U_STOP_DEFAULT))))
+            offset = target_position_pulse - current_pulse
+            offset = max(U_REG_MIN - stop, min(U_REG_MAX - stop, offset))
+            pulse = stop + offset
+        except (AttributeError, KeyError, TypeError, ValueError):
+            offset = signed_direction * 6
+            pulse = U_STOP_DEFAULT + offset
+        command = f"T{motor}:{offset}:{self.probe_duration_ms}"
+        return {
+            "motor": motor,
+            "direction": signed_direction,
+            "duration_ms": self.probe_duration_ms,
+            "step_deg": self.probe_step_deg,
+            "pulse": pulse,
+            "offset": offset,
+            "command": command,
+        }
+
+    def verify_probe_response(self, theta_before_deg: float,
+                              theta_after_deg: float,
+                              expected_direction: int,
+                              min_delta_deg: float = 0.15) -> dict:
+        delta = float(theta_after_deg) - float(theta_before_deg)
+        verified = delta * expected_direction >= min_delta_deg
+        return {
+            "verified": verified,
+            "delta_deg": delta,
+            "action": "PROCEED_FULL_PID" if verified else "ABORT_HOLD_HIGH",
+        }
+
+
 class SafeVisualHomingMachine:
     PHASE_0_INHIBITED = PHASE_0_INHIBITED
     PHASE_1_OPTICAL_AUDIT = PHASE_1_OPTICAL_AUDIT
@@ -283,6 +374,7 @@ class SafeVisualHomingMachine:
         self.variance_threshold = variance_threshold
         self.lock_tolerance = lock_tolerance
         self.lock_duration_s = lock_duration_s
+        self.decision_gate = DecisionGate()
 
         self.phase: str = self.PHASE_0_INHIBITED
         self.oe_enabled: bool = False
@@ -334,12 +426,14 @@ class SafeVisualHomingMachine:
         self.oe_enabled = False
         self.pulses = [self.u_stop] * self.num_channels
         self.homing_locked = False
+        self.decision_gate.reset()
 
     # ---- phase 1 ----
     def start_optical_audit(self) -> None:
         if self.phase == self.PHASE_0_INHIBITED:
             self.phase = self.PHASE_1_OPTICAL_AUDIT
             self.valid_frame_streak = 0
+            self.decision_gate.reset()
 
     def begin_optical_audit(self) -> None:
         self.start_optical_audit()
@@ -360,6 +454,10 @@ class SafeVisualHomingMachine:
             self.start_optical_audit()
         if self.phase != self.PHASE_1_OPTICAL_AUDIT:
             return
+        self.decision_gate.record_audit({
+            "passed": bool(valid and variance is not None
+                            and variance < self.decision_gate.max_audit_variance_deg2)
+        })
         if valid and variance is not None and variance < self.variance_threshold:
             self.valid_frame_streak += 1
         else:
@@ -380,7 +478,12 @@ class SafeVisualHomingMachine:
     # ---- phase 2 ----
     def neutral_preload(self) -> None:
         self.pulses = [self.u_stop] * self.num_channels
-        self.oe_enabled = True
+        self.oe_enabled = (
+            self.decision_gate.consecutive_passes
+            >= self.decision_gate.required_consecutive_passes
+        )
+        # Manual phase transitions remain possible, but can never energize
+        # outputs without the consecutive audit approvals.
         if self.phase in (self.PHASE_1_OPTICAL_AUDIT, self.PHASE_0_INHIBITED):
             self.phase = self.PHASE_2_NEUTRAL_PRELOAD
 

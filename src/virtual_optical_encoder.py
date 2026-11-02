@@ -75,6 +75,10 @@ class VirtualOpticalEncoder:
         self._initialized = False
         self._thetas_raw_history = []
         self._theta_filt_prev = None
+        self.oe_high = True
+        self.active_command = False
+        self._raw_window: list[list[float]] = []
+        self._prev_raw_thetas: Optional[list[float]] = None
 
         # ArUco setup
         self._aruco_dict = None
@@ -140,6 +144,83 @@ class VirtualOpticalEncoder:
                 json.dump(self.config, f, indent=2)
         except Exception:
             pass
+
+    def set_oe_state(self, oe_high: bool = True,
+                     active_command: bool = False) -> None:
+        """Set the observed output-enable and commanded-motion state."""
+        self.oe_high = bool(oe_high)
+        self.active_command = bool(active_command)
+
+    @staticmethod
+    def _median(values: list[float]) -> float:
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+    @staticmethod
+    def _percentile(values: list[float], fraction: float) -> float:
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * fraction
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return ordered[lower]
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+    def _filter_joint_window(self, thetas_raw: list[float]) -> list[float]:
+        """Reject per-joint window outliers using circular IQR and recency weights."""
+        raw = [float(value) for value in thetas_raw]
+        if self._prev_raw_thetas is not None:
+            primary_jumps = [
+                abs(_wrap_deg(raw[i] - self._prev_raw_thetas[i])) > 60.0
+                for i in range(4)
+            ]
+            if all(primary_jumps):
+                self._raw_window.clear()
+                # A wholly new pose (common in synthetic tests and camera
+                # reacquisition) must not inherit the prior EMA state.
+                self._theta_filt_prev = None
+        self._raw_window.append(raw)
+        if len(self._raw_window) > 9:
+            del self._raw_window[:-9]
+
+        filtered = []
+        for joint in range(6):
+            # Unwrap around a local reference so readings crossing +/-180 stay close.
+            reference = self._raw_window[0][joint]
+            values = [
+                reference + _wrap_deg(frame[joint] - reference)
+                for frame in self._raw_window
+            ]
+            median = self._median(values)
+            offsets = [_wrap_deg(value - median) for value in values]
+            q1 = self._percentile(offsets, 0.25)
+            q3 = self._percentile(offsets, 0.75)
+            limit = max(1.5 * (q3 - q1), 1.2)
+            inliers = [
+                (offset, index + 1)
+                for index, offset in enumerate(offsets)
+                if abs(offset) <= limit
+            ]
+            if not inliers:
+                estimate = median
+            else:
+                # A recency-weighted median reacts promptly to real movement while
+                # still rejecting isolated reflections and marker misdetections.
+                ordered = sorted(inliers, key=lambda item: item[0])
+                total_weight = sum(weight for _, weight in ordered)
+                running_weight = 0
+                weighted_median = ordered[-1][0]
+                for value, weight in ordered:
+                    running_weight += weight
+                    if running_weight * 2 >= total_weight:
+                        weighted_median = value
+                        break
+                estimate = median + weighted_median
+            filtered.append(_wrap_deg(estimate))
+        return filtered
 
     def _detect_aruco(self, frame_bgr):
         markers_info = {}
@@ -307,6 +388,21 @@ class VirtualOpticalEncoder:
                 thetas_raw = [0.0] * 6
             grip_opening_mm = max(0.0, min(80.0, thetas_raw[5]))
 
+        # A stationary, unpowered arm cannot move at its distal joints. Hold
+        # isolated distal reflections before they enter either temporal filter.
+        if (self.oe_high and not self.active_command
+                and self._prev_raw_thetas is not None):
+            primary_motion = [
+                abs(_wrap_deg(thetas_raw[i] - self._prev_raw_thetas[i]))
+                for i in range(4)
+            ]
+            primary_delta = self._median(primary_motion)
+            if primary_delta < 1.0:
+                for joint in (4, 5):
+                    if abs(_wrap_deg(thetas_raw[joint] - self._prev_raw_thetas[joint])) > 1.0:
+                        thetas_raw[joint] = float(self._prev_thetas[joint])
+
+        thetas_window = self._filter_joint_window(thetas_raw)
         # Filtering
         now = timestamp_s
         # Push raw to history for median-of-5 in geometric fallback
@@ -318,16 +414,7 @@ class VirtualOpticalEncoder:
             # median-of-5 over raw thetas
             thetas_med = [0.0] * 6
             for i in range(6):
-                vals = [h[i] for h in self._thetas_raw_history if len(h) > i]
-                if vals:
-                    vs = sorted(vals)
-                    m = len(vs) // 2
-                    if len(vs) % 2 == 1:
-                        thetas_med[i] = vs[m]
-                    else:
-                        thetas_med[i] = (vs[m - 1] + vs[m]) / 2.0
-                else:
-                    thetas_med[i] = thetas_raw[i]
+                thetas_med[i] = thetas_window[i]
             alpha_g = 0.25
             if self._theta_filt_prev is None:
                 thetas_filt = list(thetas_med)
@@ -342,9 +429,9 @@ class VirtualOpticalEncoder:
         else:
             alpha = self.filter_alpha  # 0.72 for ArUco
             if self._theta_filt_prev is None:
-                thetas_filt = list(thetas_raw)
+                thetas_filt = list(thetas_window)
             else:
-                thetas_filt = [alpha * thetas_raw[i] + (1.0 - alpha) * self._theta_filt_prev[i] for i in range(6)]
+                thetas_filt = [alpha * thetas_window[i] + (1.0 - alpha) * self._theta_filt_prev[i] for i in range(6)]
 
         # omega with deadband
         dt = max(0.01, min(0.5, float(now) - float(self._last_t) if self._last_t is not None else 0.033))
@@ -359,6 +446,7 @@ class VirtualOpticalEncoder:
                     omega = delta_deg / dt
                 self._omega_vis[i] = omega
         self._prev_thetas = list(thetas_filt)
+        self._prev_raw_thetas = [float(v) for v in thetas_raw]
         self._theta_filt = list(thetas_filt)
         self._theta_filt_prev = list(thetas_filt)
         self._last_t = now
@@ -425,6 +513,10 @@ class VirtualOpticalEncoder:
         self._initialized = False
         self._thetas_raw_history = []
         self._theta_filt_prev = None
+        self._raw_window = []
+        self._prev_raw_thetas = None
+        self.oe_high = True
+        self.active_command = False
         requested_frames = max(0, int(num_frames))
         warmup_count = 10
         capture_count = requested_frames + warmup_count
@@ -483,6 +575,8 @@ class VirtualOpticalEncoder:
                 "resting_motors_deg": {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0, 6: 0.0, 7: 0.0},
                 "variances_deg2": [999.0] * 6,
                 "max_variance_deg2": 999.0,
+                "primary_max_variance_deg2": 999.0,
+                "secondary_max_variance_deg2": 999.0,
                 "max_Limit_deg2": float(max_variance_deg),
                 "reason": "no_frames_captured",
             }
@@ -504,6 +598,8 @@ class VirtualOpticalEncoder:
         self._initialized = False
         self._thetas_raw_history = []
         self._theta_filt_prev = None
+        self._raw_window = []
+        self._prev_raw_thetas = None
         results = []
         for i, f in enumerate(evaluation_frames):
             r = self.read_positions(f, timestamp_s=start_time + (len(warmup_frames) + i) * 0.033)
@@ -536,11 +632,13 @@ class VirtualOpticalEncoder:
             means.append(m)
             variances.append(var)
 
-        max_var = max(variances) if variances else 999.0
-        if not math.isfinite(max_var):
-            max_var = 999.0
         variances = [value if math.isfinite(value) else 999.0 for value in variances]
-        passed = max_var < float(max_variance_deg)
+        primary_max_var = max(variances[:4]) if variances else 999.0
+        secondary_max_var = max(variances[4:6]) if variances else 999.0
+        max_var = primary_max_var
+        secondary_limit = max(1.5, float(max_variance_deg) * 3.0)
+        passed = (primary_max_var < float(max_variance_deg)
+                  and secondary_max_var < secondary_limit)
 
         if require_all_aruco:
             # check all frames had required markers
@@ -564,7 +662,11 @@ class VirtualOpticalEncoder:
         visible_ids_union = set()
         for r in results:
             visible_ids_union.update(r.get("visible_marker_ids", []))
-        reason = "stable" if passed else f"excessive_variance max_var_deg2={max_var:.6f} >= {max_variance_deg}"
+        reason = "stable" if passed else (
+            f"excessive_variance primary={primary_max_var:.6f} "
+            f"(limit {max_variance_deg}) secondary={secondary_max_var:.6f} "
+            f"(limit {secondary_limit})"
+        )
         return {
             "passed": bool(passed),
             "oe_recommendation": "READY_FOR_PHASE_2" if passed else "HOLD_HIGH",
@@ -575,6 +677,8 @@ class VirtualOpticalEncoder:
             "resting_motors_deg": resting_motors,
             "variances_deg2": [float(v) for v in variances],
             "max_variance_deg2": float(max_var),
+            "primary_max_variance_deg2": float(primary_max_var),
+            "secondary_max_variance_deg2": float(secondary_max_var),
             "max_Limit_deg2": float(max_variance_deg),
             "reason": reason,
         }

@@ -61,19 +61,17 @@ def _load_config(config):
     if config is None:
         candidates = []
         # relative to cwd
-        for p in ("config/config_geometria.json", "config_geometria.json"):
-            candidates.append(os.path.join(os.getcwd(), p))
+        candidates.append(os.path.join(os.getcwd(), "config", "config_geometria.json"))
         # relative to module
         here = os.path.dirname(os.path.abspath(__file__))
         parent = os.path.dirname(here)
-        for p in ("config/config_geometria.json", "config_geometria.json"):
-            candidates.append(os.path.join(parent, p))
+        candidates.append(os.path.join(parent, "config", "config_geometria.json"))
         for c in candidates:
             if os.path.exists(c):
                 config = c
                 break
         if config is None:
-            raise FileNotFoundError("config_geometria.json not found")
+            raise FileNotFoundError("config/config_geometria.json not found")
     with open(config, "r", encoding="utf-8") as f:
         return json.load(f)
 

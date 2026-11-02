@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 
 import cv2
@@ -12,6 +13,7 @@ from src.virtual_optical_encoder import VirtualOpticalEncoder
 from src.arm_vision_analyzer import ArmVisionAnalyzer
 from src.pid_pwm_controller import (
     NonlinearPIDController,
+    DecisionGate,
     DEFAULT_JOINT_CONFIGS,
     pack_binary_frame,
     unpack_binary_frame,
@@ -211,6 +213,71 @@ def test_optical_audit_warms_up_before_evaluating_requested_frames():
     assert [frame_index for frame_index, _ in calls[:10]] == list(range(10))
     assert [frame_index for frame_index, _ in calls[10:]] == list(range(10, 40))
     assert audit["frames_evaluated"] == 30
+
+
+def test_motor2_8deg_noise_oe_high_stays_passed():
+    encoder = VirtualOpticalEncoder()
+    encoder.set_oe_state(oe_high=True, active_command=False)
+    noise = [
+        8.0, -8.0, 6.5, -7.5, 7.0, -6.5, 8.0, -7.0, 6.0, -8.0,
+        -6.5, 7.5, -8.0, 6.5, -7.0, 8.0, -7.5, 6.0, -8.0, 7.0,
+        6.5, -8.0, 7.5, -6.0, 8.0, -7.0, 6.5, -8.0, 7.0, -6.5,
+    ]
+
+    class SyntheticAnalyzer:
+        def analyze(self, frame):
+            frame_index = int(frame[0, 0, 0])
+            theta5 = 0.0 if frame_index < 10 else noise[frame_index - 10]
+            return {"thetas_deg": [0.0, 0.0, 0.0, 0.0, theta5, 0.0]}
+
+    encoder.fallback_analyzer = SyntheticAnalyzer()
+    encoder._detect_aruco = lambda _frame: {}
+    frames = [np.full((1, 1, 3), i, dtype=np.uint8) for i in range(40)]
+
+    audit = encoder.audit_pre_power(DummyCamera(frames), num_frames=30)
+
+    assert audit["frames_evaluated"] == 30
+    assert audit["passed"] is True
+    assert audit["oe_recommendation"] == "READY_FOR_PHASE_2"
+    assert audit["max_variance_deg2"] < 0.5
+    assert audit["secondary_max_variance_deg2"] < 0.5
+
+
+def test_decision_gate_3_consecutive_passes_and_40ms_probe():
+    gate = DecisionGate()
+
+    for expected_count in (1, 2):
+        result = gate.record_audit({"max_variance_deg2": 1.49})
+        assert result["can_enable_oe"] is False
+        assert result["oe_command"] == "S"
+        assert result["consecutive_passes"] == expected_count
+
+    result = gate.record_audit({"max_variance_deg2": 1.49})
+    assert result["can_enable_oe"] is True
+    assert result["oe_command"] == "R"
+    assert result["consecutive_passes"] == 3
+
+    result = gate.record_audit({"max_variance_deg2": 1.5})
+    assert result["can_enable_oe"] is False
+    assert result["oe_command"] == "S"
+    assert result["consecutive_passes"] == 0
+
+    probe = gate.build_probe_pulse(motor=2, direction=1, current_deg=90.0)
+    assert probe["duration_ms"] == 40
+    assert probe["step_deg"] == 1.0
+    assert probe["command"].endswith(":40")
+    response = gate.verify_probe_response(
+        theta_before_deg=90.0,
+        theta_after_deg=91.0,
+        expected_direction=1,
+    )
+    assert response["verified"] is True
+    assert response["action"] == "PROCEED_FULL_PID"
+
+
+def test_single_source_of_truth_geometry_config():
+    assert os.path.exists("config/config_geometria.json") is True
+    assert os.path.exists("config_geometria.json") is False
 
 
 def test_nonlinear_pid_deadband_and_gravity():

@@ -4,6 +4,8 @@ Firmware for the 8-axis 3D-printed arm. Drives 8 MG946R servos through a PCA9685
 (0x40, 50 Hz) over hardware I2C (SDA=pin20, SCL=pin21). Only `<Wire.h>` and the
 AVR core are used.
 
+**Note:** `firmware_mega/firmware_mega.ino` (v2.1.0) is the **official canonical firmware binary** flashed to `COM4`. This sketch (`firmware/mega2560_arm/`) is an alternative modular implementation; both should share the core protocol contract (`I`, `S`, `R`, `Q`, `Z`, `G`, `T`, `C`, `U`, `J6`, `E`, `V`, `F`), though coverage may differ.
+
 ## Build
 ```
 arduino-cli compile --fqbn arduino:avr:mega firmware/mega2560_arm

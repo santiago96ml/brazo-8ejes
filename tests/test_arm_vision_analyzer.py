@@ -164,3 +164,24 @@ def test_wrist_roll_uses_signed_dark_servo_silhouette_asymmetry():
     )
 
     assert 0.0 < theta5 <= 90.0
+
+
+def test_bev_45deg_turntable_tilt_and_base_theta1():
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+    cv2.line(mask, (640, 185), (500, 375), 255, 42)
+    cv2.line(mask, (640, 185), (780, 375), 255, 42)
+    cv2.ellipse(mask, (640, 590), (140, 99), 0, 0, 360, 255, 18)
+
+    analyzer = ArmVisionAnalyzer(mode="geometric")
+    analyzer._blue_mask = lambda _frame: (mask, np.zeros((*mask.shape, 3), dtype=np.uint8))
+
+    result = analyzer.analyze(frame)
+
+    assert result["mode_used"] == "geometric"
+    assert result["debug"]["camera_tilt_optimal"] is True
+    assert 35.0 <= result["debug"]["camera_tilt_deg"] <= 55.0
+    assert abs(result["debug"]["turntable_ellipse_ratio"] - 0.707) < 0.05
+    theta1 = result["thetas_deg"][0]
+    assert isinstance(theta1, float)
+    assert 0.0 <= theta1 < 360.0

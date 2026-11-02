@@ -69,6 +69,9 @@ def _write_annotated_snapshot(frame, path, encoder, optical_audit, camera_status
                 end = (int(top_left[0] + top_vec[0]), int(top_left[1] + top_vec[1]))
                 cv2.arrowedLine(annotated, start, end, (0, 0, 255), 2)
 
+        tilt_deg = 0.0
+        ellipse_ratio = 0.0
+        tilt_optimal = False
         analyzer = getattr(encoder, "fallback_analyzer", None)
         if analyzer is not None:
             try:
@@ -98,6 +101,10 @@ def _write_annotated_snapshot(frame, path, encoder, optical_audit, camera_status
                         annotated, label, (point[0] + 9, point[1] - 9),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
                     )
+                debug = geometry.get("debug", {}) if isinstance(geometry, dict) else {}
+                tilt_deg = float(debug.get("camera_tilt_deg", tilt_deg))
+                ellipse_ratio = float(debug.get("turntable_ellipse_ratio", ellipse_ratio))
+                tilt_optimal = bool(debug.get("camera_tilt_optimal", tilt_optimal))
             except Exception:
                 pass
 
@@ -109,6 +116,16 @@ def _write_annotated_snapshot(frame, path, encoder, optical_audit, camera_status
         cv2.putText(
             annotated, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
             (0, 255, 0) if optical_audit.get("passed") else (0, 0, 255), 2,
+        )
+        if tilt_optimal:
+            tilt_text = "CAM TILT: {:.1f} deg (b/a={:.2f}) [OPTIMAL 35-55 DEG]".format(tilt_deg, ellipse_ratio)
+            tilt_color = (0, 255, 0)
+        else:
+            tilt_text = "CAM TILT: {:.1f} deg (b/a={:.2f}) [ADJUST CAMERA TILT TO 35-55 DEG]".format(tilt_deg, ellipse_ratio)
+            tilt_color = (0, 255, 255)
+        cv2.putText(
+            annotated, tilt_text, (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            tilt_color, 2,
         )
         motor_values = [
             joint_report.get("motor1_pinza", {}).get("motor_deg", 0.0),
@@ -233,6 +250,10 @@ def main(argv: list[str] | None = None) -> int:
                 "max_variance_deg2": float(audit_res.get("max_variance_deg2", 999.0)),
                 "oe_recommendation": audit_res.get("oe_recommendation", "HOLD_HIGH"),
             }
+            if "primary_max_variance_deg2" in audit_res:
+                optical_audit["primary_max_variance_deg2"] = audit_res.get("primary_max_variance_deg2")
+            if "secondary_max_variance_deg2" in audit_res:
+                optical_audit["secondary_max_variance_deg2"] = audit_res.get("secondary_max_variance_deg2")
 
             # Read positions from latest frame
             pos_res = encoder.read_positions(frame) if frame is not None else encoder._empty_result(0.0)
@@ -342,6 +363,27 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 tcp_cartesian_mm = {"x": 0.0, "y": 0.0, "z": 0.0}
 
+            camera_framing_45deg = {"tilt_deg": 0.0, "ellipse_ratio_b_a": 0.0, "optimal_35_to_55": False, "status": "ADJUST_TO_35_55_DEG"}
+            try:
+                _an = getattr(encoder, "fallback_analyzer", None)
+                if _an is None:
+                    from src.arm_vision_analyzer import ArmVisionAnalyzer
+                    _an = ArmVisionAnalyzer(mode="geometric")
+                if frame is not None:
+                    _geom = _an.analyze(frame)
+                    _dbg = _geom.get("debug", {}) if isinstance(_geom, dict) else {}
+                    _tilt = float(_dbg.get("camera_tilt_deg", 0.0))
+                    _ratio = float(_dbg.get("turntable_ellipse_ratio", 0.0))
+                    _opt = bool(_dbg.get("camera_tilt_optimal", False))
+                    camera_framing_45deg = {
+                        "tilt_deg": _tilt,
+                        "ellipse_ratio_b_a": _ratio,
+                        "optimal_35_to_55": _opt,
+                        "status": "OPTIMAL_45_DEG" if _opt else "ADJUST_TO_35_55_DEG",
+                    }
+            except Exception:
+                pass
+
     except Exception as e:
         # Still produce a report even if camera fails
         optical_audit = {
@@ -362,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         tcp_cartesian_mm = {"x": 0.0, "y": 0.0, "z": 0.0}
         camera_status = {"fps": 0.0, "resolution": None, "backend": f"error:{e}"}
+        camera_framing_45deg = {"tilt_deg": 0.0, "ellipse_ratio_b_a": 0.0, "optimal_35_to_55": False, "status": "ADJUST_TO_35_55_DEG"}
 
     if frame is not None:
         _write_annotated_snapshot(
@@ -373,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         "optical_audit": optical_audit,
         "joint_positions": joint_positions_report,
         "tcp_cartesian_mm": tcp_cartesian_mm,
+        "camera_framing_45deg": camera_framing_45deg,
         "next_bringup_sequence": homing.bringup_order,
     }
 
