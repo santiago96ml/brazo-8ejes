@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import call, patch
 
 from tools.single_motor_test import run_single_motor_test
 
@@ -87,12 +88,82 @@ class TestSingleMotorTest(unittest.TestCase):
         return result, camera, encoder, transport
 
     def test_dry_run_sends_nothing_and_never_enables_oe(self):
-        result, camera, _encoder, transport = self.run_test(dry_run=True)
+        result, camera, encoder, transport = self.run_test(dry_run=True)
 
         self.assertEqual(result["status"], "OK")
         self.assertEqual(result["oe_sequence"], [])
         self.assertEqual(transport.commands, [])
+        self.assertTrue(encoder.oe_high)
         self.assertTrue(camera.stopped)
+
+    def test_retries_failed_port_open_once_after_fresh_autodetection(self):
+        camera = FakeCamera()
+        encoder = FakeEncoder()
+        transport = FakeTransport(encoder)
+        with patch("host.armctl.transport.resolve_serial_port", return_value=("COM4", False)), \
+             patch("host.armctl.transport.detect_auto_serial_port", return_value="COM8"), \
+             patch("tools.single_motor_test._open_transport", side_effect=[FileNotFoundError("COM4"), transport]) as open_port:
+            result = run_single_motor_test(
+                motor=1, port="COM4", frames=3, camera=camera, encoder=encoder,
+            )
+
+        self.assertEqual(open_port.call_args_list, [call("COM4"), call("COM8")])
+        self.assertEqual(result["port_requested"], "COM4")
+        self.assertEqual(result["port_used"], "COM8")
+        self.assertTrue(result["port_autodetected"])
+        self.assertEqual(result["status"], "OK")
+
+    def test_warms_camera_and_retries_empty_audits_until_three_valid_passes(self):
+        clock = {"now": 0.0}
+
+        class WarmingCamera(FakeCamera):
+            empty_audits_remaining = 2
+
+            def get_latest_frame(self):
+                if clock["now"] >= 1.2 and self.empty_audits_remaining:
+                    self.empty_audits_remaining -= 1
+                    self.timestamp += 1
+                    return None, self.timestamp, 30.0
+                return super().get_latest_frame()
+
+        class EmptyAuditEncoder(FakeEncoder):
+            def audit_pre_power(self, camera, num_frames, max_variance_deg):
+                frame, _timestamp, _fps = camera.get_latest_frame()
+                if frame is None:
+                    self.audit_calls += 1
+                    return {
+                        "passed": False,
+                        "frames_evaluated": 0,
+                        "max_variance_deg2": 999.0,
+                        "variances_deg2": [999.0] * 6,
+                        "mode_used": "none",
+                        "visible_marker_ids": [],
+                    }
+                return super().audit_pre_power(camera, num_frames, max_variance_deg)
+
+        def monotonic():
+            return clock["now"]
+
+        def sleep(duration):
+            clock["now"] += duration
+
+        camera = WarmingCamera()
+        encoder = EmptyAuditEncoder()
+        with patch("tools.single_motor_test.time.monotonic", side_effect=monotonic), \
+             patch("tools.single_motor_test.time.sleep", side_effect=sleep), \
+             patch("host.armctl.transport.resolve_serial_port", return_value=("COM8", True)):
+            result = run_single_motor_test(
+                motor=1, port="auto", frames=3, camera=camera, encoder=encoder,
+                dry_run=True,
+            )
+
+        self.assertEqual(encoder.audit_calls, 5)
+        self.assertEqual(result["decision_gate"]["consecutive_passes"], 3)
+        self.assertEqual(len(result["decision_gate"]["audit_results"]), 3)
+        self.assertEqual(result["audit"]["frames_evaluated"], [3, 3, 3])
+        self.assertEqual(result["port_used"], "COM8")
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["oe_sequence"], [])
 
     def test_failed_audit_aborts_without_enabling_oe(self):
         encoder = FakeEncoder(audit_variance=9.0)

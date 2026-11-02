@@ -38,6 +38,16 @@ def _open_transport(port: str):
     return SerialTransport(port, 115200)
 
 
+def _is_retryable_port_error(exc: Exception) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    try:
+        import serial
+    except ImportError:
+        return False
+    return isinstance(exc, serial.SerialException)
+
+
 def _joint_angle(reading: dict, motor: int) -> float:
     if motor not in _MOTOR_JOINTS:
         raise ValueError("Motor 8 (AUX) has no optical joint angle and cannot be verified safely")
@@ -131,7 +141,7 @@ def _save_snapshot(frame: Any, path: str | None) -> str | None:
 def run_single_motor_test(
     *,
     motor: int = 1,
-    port: str = "COM4",
+    port: str = "auto",
     camera_index: int = 0,
     frames: int = 30,
     delta_deg: float = 8.0,
@@ -159,8 +169,10 @@ def run_single_motor_test(
     odometry = odometry or PulseOdometry()
     camera = camera or FastUSBCamera(index=int(camera_index), width=1280, height=720, fps=30)
     owns_transport = transport is None and not dry_run
-    if owns_transport:
-        transport = _open_transport(port)
+    from host.armctl.transport import detect_auto_serial_port, resolve_serial_port
+
+    requested_port = port
+    port_used, port_autodetected = resolve_serial_port(port)
 
     decision_gate = DecisionGate(
         max_audit_variance_deg2=1.5,
@@ -188,6 +200,9 @@ def run_single_motor_test(
     result = {
         "status": "ABORT_AUDIT",
         "motor": motor,
+        "port_requested": requested_port,
+        "port_used": port_used,
+        "port_autodetected": port_autodetected,
         "audit": {},
         "decision_gate": {},
         "baseline": {},
@@ -198,34 +213,47 @@ def run_single_motor_test(
         "snapshot": None,
     }
     try:
-        # Establish OE=HIGH on the controller before opening or sampling the camera.
-        if not dry_run:
-            send("S")
         camera.start()
+        warmup_deadline = time.monotonic() + 1.2
+        while time.monotonic() < warmup_deadline:
+            camera.get_latest_frame()
+            time.sleep(0.005)
 
         audits = []
         gate_results = []
         for _ in range(3):
-            try:
-                audit = encoder.audit_pre_power(
-                    camera, num_frames=int(frames), max_variance_deg=1.5
-                )
-            except Exception as exc:
-                audit = {
-                    "passed": False,
-                    "max_variance_deg2": 999.0,
-                    "variances_deg2": [999.0] * 6,
-                    "reason": f"error:{exc}",
-                    "frames_evaluated": 0,
-                    "mode_used": "none",
-                    "visible_marker_ids": [],
-                }
+            retries = 0
+            while True:
+                try:
+                    audit = encoder.audit_pre_power(
+                        camera, num_frames=int(frames), max_variance_deg=1.5
+                    )
+                except Exception as exc:
+                    audit = {
+                        "passed": False,
+                        "max_variance_deg2": 999.0,
+                        "variances_deg2": [999.0] * 6,
+                        "reason": f"error:{exc}",
+                        "frames_evaluated": 0,
+                        "mode_used": "none",
+                        "visible_marker_ids": [],
+                    }
+                if int(audit.get("frames_evaluated", 0)) > 0:
+                    break
+                if retries >= 3:
+                    break
+                retries += 1
+                time.sleep(0.35)
             audits.append(audit)
+            if int(audit.get("frames_evaluated", 0)) <= 0:
+                break
             gate_results.append(decision_gate.record_audit(audit))
         last_audit = audits[-1]
         max_variance = float(last_audit.get("max_variance_deg2", 999.0))
         result["audit"] = {
-            "passed": all(bool(item.get("passed")) for item in audits),
+            "passed": len(audits) == 3 and len(gate_results) == 3 and all(
+                bool(item.get("passed")) for item in audits
+            ),
             "max_variance_deg2": max_variance,
             "frames_evaluated": [int(item.get("frames_evaluated", 0)) for item in audits],
             "mode_used": last_audit.get("mode_used", "none"),
@@ -239,7 +267,7 @@ def run_single_motor_test(
                 for item in audits
             ],
         }
-        can_enable = bool(gate_results[-1].get("can_enable_oe"))
+        can_enable = bool(gate_results and gate_results[-1].get("can_enable_oe"))
         variances = last_audit.get("variances_deg2", [max_variance] * 6)
         joint_index, joint_name = _MOTOR_JOINTS[motor]
         joint_variance = float(variances[joint_index]) if len(variances) > joint_index else max_variance
@@ -255,6 +283,31 @@ def run_single_motor_test(
         if not can_enable:
             result["status"] = "ABORT_AUDIT"
             return result
+
+        if owns_transport:
+            try:
+                transport = _open_transport(port_used)
+            except Exception as exc:
+                if not _is_retryable_port_error(exc):
+                    result["audit"]["reason"] = f"port_open_error:{exc}"
+                    return result
+                retry_port = detect_auto_serial_port()
+                if not retry_port:
+                    result["audit"]["reason"] = f"port_open_error:{exc}; no Arduino/CH340 port detected"
+                    return result
+                port_used = retry_port
+                port_autodetected = True
+                result["port_used"] = port_used
+                result["port_autodetected"] = True
+                try:
+                    transport = _open_transport(port_used)
+                except Exception as retry_exc:
+                    result["audit"]["reason"] = f"port_open_error:{retry_exc}"
+                    return result
+
+        # Keep the controller stopped before baseline sampling or any motion decision.
+        if not dry_run:
+            send("S")
 
         last_frame, last_timestamp = _read_frame(camera)
         # Keep the full optical reading in the baseline report for diagnosis.
@@ -273,7 +326,8 @@ def run_single_motor_test(
         if not dry_run:
             send("R")
             time.sleep(0.150)
-        encoder.set_oe_state(oe_high=False, active_command=True)
+        if not dry_run:
+            encoder.set_oe_state(oe_high=False, active_command=True)
 
         probe = None
         if needs_probe:
@@ -375,7 +429,7 @@ def _json_safe(value: Any) -> Any:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Safely test one motor with an optical audit")
     parser.add_argument("--motor", type=int, choices=range(1, 9), default=1)
-    parser.add_argument("--port", default="COM4")
+    parser.add_argument("--port", default="auto", help="serial port (default: auto-detect CH340/Arduino)")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--frames", type=int, default=30)
     parser.add_argument("--delta-deg", type=float, default=8.0)
@@ -406,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             result = {
                 "status": "ABORT_AUDIT", "motor": motor,
+                "port_requested": args.port, "port_used": args.port,
+                "port_autodetected": False,
                 "audit": {"reason": f"error:{exc}"},
                 "decision_gate": {}, "baseline": {},
                 "commanded": {"offset": 0, "ms": args.burst_ms},
@@ -416,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.json or args.sequence:
             print(json.dumps(_json_safe(result), sort_keys=True))
         else:
-            print(f"Motor {motor}: {result['status']}")
+            print(f"Motor {motor} ({result.get('port_used', args.port)}): {result['status']}")
             print(json.dumps(_json_safe(result), sort_keys=True, indent=2))
         exit_code = max(exit_code, _exit_code(result))
         if result.get("status") in ("ABORT_AUDIT", "ABORT_PROBE", "NO_MOTION"):

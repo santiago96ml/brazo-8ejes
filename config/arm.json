@@ -1,5 +1,6 @@
 {
-  "port": "COM4",
+  "port": "auto",
+  "port_note": "auto = detect the CH340/Arduino port; set COMx to force one",
   "baud": 115200,
   "watchdog_ms": 3000,
   "speed_dps": 60,

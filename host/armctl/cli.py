@@ -15,7 +15,7 @@ from .protocol import (cmd_info, cmd_version, cmd_stop, cmd_enable, cmd_neutral,
                       cmd_mode, cmd_limits, cmd_mirror, cmd_invert, cmd_multi,
                       cmd_home, cmd_home_set, cmd_save, cmd_defaults,
                       cmd_watchdog, cmd_keepalive, cmd_state, cmd_auto, parse_line)
-from .transport import SerialTransport, TcpTransport, SimTransport
+from .transport import SerialTransport, TcpTransport, SimTransport, resolve_serial_port
 
 
 def _make_transport(args, cfg):
@@ -25,6 +25,10 @@ def _make_transport(args, cfg):
         host, port = args.tcp.rsplit(":", 1)
         return TcpTransport(host, int(port))
     port = args.port or cfg.get("port", "COM4")
+    if port.lower() == "auto":
+        port, _autodetected = resolve_serial_port(port)
+        if port.lower() == "auto":
+            raise RuntimeError("No Arduino/CH340 serial port detected; connect the board or pass --port COMx")
     baud = args.baud or cfg.get("baud", 115200)
     return SerialTransport(port, baud, reset_wait=not getattr(args, "no_reset_wait", False))
 
@@ -452,6 +456,11 @@ def _do_scan(args, cfg):
     if args.sim:
         print("SIM: board OK")
         return 0
+    if port.lower() == "auto":
+        port, _autodetected = resolve_serial_port(port)
+        if port.lower() == "auto":
+            print("ERROR: no Arduino/CH340 serial port detected; pass --port COMx")
+            return 1
     # check port exists
     try:
         from serial.tools import list_ports
@@ -479,6 +488,8 @@ def _do_scan(args, cfg):
 
 def _do_doctor(args, cfg):
     port = args.port or cfg.get("port", "COM4")
+    if port.lower() == "auto":
+        port, _autodetected = resolve_serial_port(port)
     print("port: %s" % port)
     for j in cfg["joints"]:
         print("motor %d: %s (%s)" % (j.get("motor"), j.get("name"), j.get("label", "")))

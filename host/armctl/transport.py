@@ -2,13 +2,51 @@
 
 import json
 import queue
+import re
 import socket
 import threading
 import time
+import os
 
 import serial
 
 from .sim import SimDevice
+
+
+def detect_auto_serial_port():
+    """Return the best matching Arduino serial port, or None if none are found."""
+    from serial.tools import list_ports
+
+    ports = list(list_ports.comports())
+    for port in ports:
+        if port.vid == 0x1A86 and port.pid == 0x7523:
+            return port.device
+    for port in ports:
+        if port.vid in (0x2341, 0x2A03):
+            return port.device
+    for port in ports:
+        if re.search(r"arduino|ch340|mega", port.description or "", re.IGNORECASE):
+            return port.device
+    return None
+
+
+def resolve_serial_port(requested=None):
+    """Resolve an explicit port, ARM_PORT, or a detected Arduino port."""
+    from serial.tools import list_ports
+
+    ports = list(list_ports.comports())
+    available = {port.device for port in ports}
+    if requested and requested.lower() != "auto" and requested in available:
+        return requested, False
+
+    environment_port = os.environ.get("ARM_PORT")
+    if environment_port and environment_port in available:
+        return environment_port, False
+
+    detected = detect_auto_serial_port()
+    if detected:
+        return detected, True
+    return requested or "auto", False
 
 
 class SerialTransport:

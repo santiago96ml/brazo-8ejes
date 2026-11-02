@@ -13,7 +13,7 @@ TowerPro MG946R servos over USB serial, with an optional ESP32/ESP32-C3 WiFi bri
 ## Repository layout
 
 ```text
-firmware_mega/            Official canonical firmware (v2.1.0) — flashed to COM4
+firmware_mega/            Official canonical firmware (v2.1.0) — COMx detected automatically (CH340); pass `--port` to force one
 firmware/mega2560_arm/    Alternative sketch (motor numbering 1..7 + AUX)
 firmware/esp32_bridge/    WiFi <-> UART1 transparent bridge
 host/armctl/              Python controller and CLI
@@ -26,7 +26,7 @@ docs/                     wiring, protocol, calibration
 odd/tasks/                feature specification and decision log
 ```
 
-**Note:** `firmware_mega/firmware_mega.ino` (v2.1.0) is the **official canonical firmware binary** flashed to `COM4`. The `firmware/mega2560_arm/` variant uses a different modular structure and may not implement all commands (`Z`, `G`, `U`, etc.) supported by the canonical firmware. Both share the core protocol contract (`I`, `S`, `R`, `Q`, `Z`, `G`, `T`, `C`, `U`, `J6`, `E`, `V`, `F`).
+**Note:** `firmware_mega/firmware_mega.ino` (v2.1.0) is the **official canonical firmware binary**. The serial port is COMx detected automatically (CH340); pass `--port` to force one. The `firmware/mega2560_arm/` variant uses a different modular structure and may not implement all commands (`Z`, `G`, `U`, etc.) supported by the canonical firmware. Both share the core protocol contract (`I`, `S`, `R`, `Q`, `Z`, `G`, `T`, `C`, `U`, `J6`, `E`, `V`, `F`).
 
 ## Quick start
 
@@ -38,10 +38,10 @@ odd/tasks/                feature specification and decision log
    powershell -ExecutionPolicy Bypass -File tools\arduino.ps1 build
    ```
 
-3. Upload to the board on `COM4`:
+3. Upload to the board on its detected COMx port (CH340); pass `-Port COMx` to force one:
 
    ```powershell
-   powershell -ExecutionPolicy Bypass -File tools\arduino.ps1 upload -Port COM4
+   powershell -ExecutionPolicy Bypass -File tools\arduino.ps1 upload -Port COMx
    ```
 
    ``arduino.ps1 doctor`` prints the detected CLI, cores, boards and serial ports.
@@ -108,7 +108,7 @@ armctl script <file>
 armctl raw "<protocol line>"
 ```
 
-Global flags: `--port COM4`, `--baud 115200`, `--tcp HOST:PORT`, `--sim`,
+Global flags: `--port COMx` (detected automatically for CH340; pass `--port` to force one), `--baud 115200`, `--tcp HOST:PORT`, `--sim`,
 `--config config/arm.json`, `--json`.
 
 On exit the controller leaves the arm enabled and holding by default; the firmware
@@ -145,7 +145,7 @@ The bridge is byte-transparent: same protocol, no changes on the host side.
 | Symptom | Check |
 |---|---|
 | `I` returns an I2C error | `SDA` pin 20, `SCL` pin 21, common ground, 3.3/5 V on `VCC` |
-| Board not detected | CH340 driver, another program holding `COM4`, try `arduino.ps1 doctor` |
+| Board not detected | Check the CH340 driver or whether another program holds the port; try `arduino.ps1 doctor` |
 | Upload fails | Close the serial monitor, confirm `arduino:avr` core is installed |
 | All servos buzz at rest | servo rail sag, missing common ground, or stop pulse off by a few counts |
 | One servo creeps | calibrate its stop pulse (`C<motor>:<pulse>`) and `E` |

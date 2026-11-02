@@ -6,7 +6,10 @@
 - **Common ground.** Ensure common ground between Mega, PCA9685, and servo supply.
 - **Servos OFF at start.** `OE=HIGH` until Phase 1 passes and `DecisionGate` authorizes `R`.
 - **Horns loose.** Test with servo horns loose. See [docs/CALIBRATION.md](docs/CALIBRATION.md).
-- **Firmware:** `firmware_mega/firmware_mega.ino` v2.1.0 is the canonical binary for COM4.
+- **Firmware:** `firmware_mega/firmware_mega.ino` v2.1.0 is the canonical binary. The COMx port is detected automatically for the CH340; pass `--port` to force one.
+
+## Port changed / board not found
+The CH340 can move from COM4 to COM8 after a replug. Use `--port auto` (the default) or check the current assignment with `Get-CimInstance Win32_PnPEntity | Where-Object Name -match 'COM\d+'`. Never edit code to change ports; pass `--port COMx` only when you need to force a specific port.
 
 ## Bring-up order
 Follow this order strictly (one motor at a time):
