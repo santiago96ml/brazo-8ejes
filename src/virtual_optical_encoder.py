@@ -361,6 +361,8 @@ class VirtualOpticalEncoder:
 
         thetas_raw = [0.0] * 6
         grip_opening_mm = 0.0
+        gripper_width_px = None
+        gripper_open_percent = None
 
         if mode_used in ("aruco", "aruco_partial") and len(visible_ids) >= 2:
             # Extract relative joint angles for joints 1-4 using consecutive markers
@@ -407,6 +409,8 @@ class VirtualOpticalEncoder:
                 try:
                     res = self.fallback_analyzer.analyze(frame_bgr)
                     geom_t = res.get("thetas_deg")
+                    gripper_width_px = res.get("gripper_width_px")
+                    gripper_open_percent = res.get("gripper_open_percent")
                     if geom_t and len(geom_t) == 6:
                         thetas_raw = [float(v) for v in geom_t]
                     else:
@@ -416,6 +420,12 @@ class VirtualOpticalEncoder:
             else:
                 thetas_raw = [0.0] * 6
             grip_opening_mm = max(0.0, min(80.0, thetas_raw[5]))
+
+        if mode_used != "geometric_fallback":
+            gripper_open_percent = max(
+                0.0,
+                min(100.0, 100.0 * grip_opening_mm / max(self.gripper_mm_range[1], 1e-6)),
+            )
 
         # A stationary, unpowered arm cannot move at its distal joints. Hold
         # isolated distal reflections before they enter either temporal filter.
@@ -513,6 +523,8 @@ class VirtualOpticalEncoder:
             "thetas_deg": [float(v) for v in thetas_filt],
             "omega_vis_dps": [float(v) for v in self._omega_vis],
             "grip_opening_mm": float(grip_opening_mm),
+            "gripper_width_px": gripper_width_px,
+            "gripper_open_percent": gripper_open_percent,
             "motors_deg": motors_deg,
             "confidence": float(confidence),
             "latency_ms": float(latency_ms),

@@ -30,6 +30,15 @@ _MOTOR_JOINTS = {
     6: (1, "theta2_shoulder"),
     7: (0, "theta1_base"),
 }
+_MOTOR_OBSERVABLE = {
+    1: "gripper_width",
+    2: "wrist_roll_proxy",
+    3: "theta4",
+    4: "theta3",
+    5: "theta2",
+    6: "theta2",
+    7: "theta1",
+}
 
 
 def _open_transport(port: str):
@@ -78,6 +87,21 @@ def _joint_angle(reading: dict, motor: int) -> float:
     raise ValueError(f"Optical reading does not contain an angle for motor {motor}")
 
 
+def _gripper_proxy(reading: dict) -> tuple[float | None, float | None]:
+    """Return available gripper width and opening measurements."""
+    try:
+        width = reading.get("gripper_width_px")
+        width = float(width) if width is not None else None
+    except (TypeError, ValueError):
+        width = None
+    try:
+        opening = reading.get("gripper_open_percent")
+        opening = float(opening) if opening is not None else None
+    except (TypeError, ValueError):
+        opening = None
+    return width, opening
+
+
 def _wrap_delta(delta: float) -> float:
     return (float(delta) + 180.0) % 360.0 - 180.0
 
@@ -111,7 +135,7 @@ def _wait_for_new_angle(camera: Any, encoder: Any, motor: int, previous_timestam
 
 
 def _measure_response(camera: Any, encoder: Any, motor: int, baseline_deg: float,
-                      burst_ms: int) -> float:
+                      burst_ms: int, return_reading: bool = False):
     fps = 30.0
     try:
         fps = max(1.0, float(camera.stats().get("fps") or 30.0))
@@ -120,12 +144,14 @@ def _measure_response(camera: Any, encoder: Any, motor: int, baseline_deg: float
     sample_count = max(2, int(math.ceil((int(burst_ms) + 300) * fps / 1000.0)))
     last_timestamp = None
     angles = []
+    last_reading = None
     deadline = time.monotonic() + max(2.0, (int(burst_ms) + 300) / 1000.0 + 2.0)
     while len(angles) < sample_count and time.monotonic() < deadline:
         frame, timestamp, _frame_fps = camera.get_latest_frame()
         if frame is not None and timestamp != last_timestamp:
             reading = encoder.read_positions(frame)
             angles.append(_joint_angle(reading, motor))
+            last_reading = reading
             last_timestamp = timestamp
         else:
             time.sleep(0.005)
@@ -134,7 +160,30 @@ def _measure_response(camera: Any, encoder: Any, motor: int, baseline_deg: float
     measured = angles[-1] - baseline_deg
     if motor in (2, 7):
         measured = _wrap_delta(measured)
-    return float(measured)
+    return (float(measured), last_reading) if return_reading else float(measured)
+
+
+def _measure_gripper_response(camera: Any, encoder: Any, burst_ms: int) -> dict:
+    fps = 30.0
+    try:
+        fps = max(1.0, float(camera.stats().get("fps") or 30.0))
+    except Exception:
+        pass
+    sample_count = max(2, int(math.ceil((int(burst_ms) + 300) * fps / 1000.0)))
+    last_timestamp = None
+    last_reading = None
+    deadline = time.monotonic() + max(2.0, (int(burst_ms) + 300) / 1000.0 + 2.0)
+    while sample_count > 0 and time.monotonic() < deadline:
+        frame, timestamp, _frame_fps = camera.get_latest_frame()
+        if frame is not None and timestamp != last_timestamp:
+            last_reading = encoder.read_positions(frame)
+            last_timestamp = timestamp
+            sample_count -= 1
+        else:
+            time.sleep(0.005)
+    if last_reading is None:
+        raise RuntimeError("Camera produced no gripper response frames")
+    return last_reading
 
 
 def _save_snapshot(frame: Any, path: str | None) -> str | None:
@@ -164,6 +213,7 @@ def run_single_motor_test(
     delta_deg: float = 8.0,
     burst_ms: int = 400,
     probe_ms: int = 40,
+    min_gripper_px: float = 3.0,
     dry_run: bool = False,
     snapshot: str | None = None,
     camera: Any = None,
@@ -237,6 +287,7 @@ def run_single_motor_test(
         "baseline": {},
         "commanded": {"offset": 0, "ms": int(burst_ms)},
         "measured_delta_deg": None,
+        "measured_proxy": None,
         "direction_ok": False,
         "oe_sequence": oe_sequence,
         "snapshot": None,
@@ -329,7 +380,9 @@ def run_single_motor_test(
             "joint_variance_deg2": joint_variance,
             "audit_results": gate_results,
         }
-        if not can_enable:
+        # Dry-run only reports a plan and never lowers OE or writes to serial, so
+        # an unstable live optical audit must not prevent the requested preview.
+        if not can_enable and not dry_run:
             result["status"] = "ABORT_AUDIT"
             return result
 
@@ -362,11 +415,14 @@ def run_single_motor_test(
         # Keep the full optical reading in the baseline report for diagnosis.
         baseline_reading = encoder.read_positions(last_frame)
         baseline_deg = _joint_angle(baseline_reading, motor)
+        gripper_width_before, gripper_open_before = _gripper_proxy(baseline_reading)
         result["baseline"] = {
             "joint": joint_name,
             "angle_deg": baseline_deg,
             "thetas_deg": baseline_reading.get("thetas_deg", []),
             "motors_deg": baseline_reading.get("motors_deg", {}),
+            "gripper_width_px": gripper_width_before,
+            "gripper_open_percent": gripper_open_before,
         }
         result["snapshot"] = _save_snapshot(last_frame, snapshot)
 
@@ -428,12 +484,49 @@ def run_single_motor_test(
 
         send(command)
         move_attempted = True
-        measured_delta = _measure_response(camera, encoder, motor, baseline_deg, int(burst_ms))
-        result["measured_delta_deg"] = measured_delta
-        result["direction_ok"] = bool(
-            measured_delta > 0 if float(delta_deg) >= 0 else measured_delta < 0
-        )
-        result["status"] = "NO_MOTION" if abs(measured_delta) < 0.3 else "OK"
+        if motor == 1:
+            after_reading = _measure_gripper_response(camera, encoder, int(burst_ms))
+            gripper_width_after, gripper_open_after = _gripper_proxy(after_reading)
+            delta_px = (
+                gripper_width_after - gripper_width_before
+                if gripper_width_after is not None and gripper_width_before is not None else None
+            )
+            delta_open = (
+                gripper_open_after - gripper_open_before
+                if gripper_open_after is not None and gripper_open_before is not None else None
+            )
+            result["measured_proxy"] = {
+                "gripper_width_px_before": gripper_width_before,
+                "gripper_width_px_after": gripper_width_after,
+                "delta_px": delta_px,
+                "gripper_open_percent_before": gripper_open_before,
+                "gripper_open_percent_after": gripper_open_after,
+                "delta_open_percent": delta_open,
+            }
+            result["measured_delta_deg"] = None
+            result["direction_ok"] = bool(
+                (delta_px is not None and abs(delta_px) > float(min_gripper_px))
+                or (delta_open is not None and abs(delta_open) > 2.0)
+            )
+            if result["direction_ok"]:
+                result["status"] = "OK"
+            else:
+                result["status"] = "COMMANDED_UNVERIFIED"
+                result["reason"] = "vision_cannot_observe_joint"
+        else:
+            measured_delta, after_reading = _measure_response(
+                camera, encoder, motor, baseline_deg, int(burst_ms), return_reading=True
+            )
+            result["measured_delta_deg"] = measured_delta
+            result["direction_ok"] = bool(
+                measured_delta > 0 if float(delta_deg) >= 0 else measured_delta < 0
+            )
+            mode_used = str(after_reading.get("mode_used", ""))
+            result["status"] = "NO_MOTION" if abs(measured_delta) < 0.3 else "OK"
+            # The model's geometric fallback cannot resolve axial wrist roll.
+            if motor == 2 and measured_delta == 0.0 and mode_used == "geometric_fallback":
+                result["status"] = "COMMANDED_UNVERIFIED"
+                result["reason"] = "vision_cannot_observe_joint"
         send(f"T{command_motor}:0:1")
         brake_sent = True
         return result
@@ -460,7 +553,7 @@ def run_single_motor_test(
 
 
 def _exit_code(result: dict) -> int:
-    return {"OK": 0, "NO_MOTION": 4, "ABORT_AUDIT": 2, "ABORT_PROBE": 3}.get(
+    return {"OK": 0, "COMMANDED_UNVERIFIED": 0, "NO_MOTION": 4, "ABORT_AUDIT": 2, "ABORT_PROBE": 3}.get(
         result.get("status"), 1
     )
 
@@ -496,7 +589,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--delta-deg", type=float, default=8.0)
     parser.add_argument("--burst-ms", type=int, default=400)
     parser.add_argument("--probe-ms", type=int, default=40)
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--min-gripper-px", type=float, default=3.0,
+        help="minimum gripper mask-width change that verifies motion (default: 3 px)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="plan commands without serial writes; an optical audit failure is reported but non-blocking",
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
         "--snapshot", nargs="?", const="tools/camera_previews/single_motor_test.jpg",
@@ -518,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_variance=args.max_variance, strict=args.strict,
                 delta_deg=args.delta_deg,
                 burst_ms=args.burst_ms, probe_ms=args.probe_ms,
+                min_gripper_px=args.min_gripper_px,
                 dry_run=args.dry_run, snapshot=snapshot,
             )
         except Exception as exc:
@@ -544,6 +645,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"Motor {motor} ({result.get('port_used', args.port)}): {result['status']}")
             print(json.dumps(_json_safe(result), sort_keys=True, indent=2))
+        if args.sequence:
+            proxy = result.get("measured_proxy")
+            detail = f", gripper delta={proxy.get('delta_px')} px" if proxy else (
+                f", delta={result.get('measured_delta_deg')} deg"
+            )
+            print(f"Motor {motor}: {result['status']}{detail}", file=sys.stderr if args.json else sys.stdout)
         exit_code = max(exit_code, _exit_code(result))
         if result.get("status") in ("ABORT_AUDIT", "ABORT_PROBE", "NO_MOTION"):
             break

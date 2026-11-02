@@ -156,6 +156,7 @@ class ArmVisionAnalyzer:
         use_clahe: bool = True,
         clahe_clip: float = 2.0,
         clahe_grid: int = 8,
+        gripper_max_width_px: float = 120.0,
     ):
         if cv2 is not None and aruco_dict is None:
             aruco_dict = cv2.aruco.DICT_4X4_50
@@ -182,6 +183,9 @@ class ArmVisionAnalyzer:
         self._camera_tilt_deg = 0.0
         self._turntable_ellipse_ratio = 0.0
         self._camera_tilt_optimal = False
+        self.gripper_max_width_px = max(1.0, float(gripper_max_width_px))
+        self._gripper_width_history = []
+        self._smoothed_gripper_width_px = None
 
     def _load_link_lengths(self) -> dict:
         """Load the physical link lengths once, with the audited arm as fallback."""
@@ -358,7 +362,7 @@ class ArmVisionAnalyzer:
             return None
         return kp
 
-    def _derive_angles(self, kp):
+    def _derive_angles(self, kp, theta6: float = 50.0):
         def get(name):
             v = kp.get(name)
             if v is None:
@@ -383,8 +387,47 @@ class ArmVisionAnalyzer:
         theta3 = theta2 - seg(elbow, wrist)
         theta4 = seg(wrist, tip) - seg(elbow, wrist)
         theta5 = 0.0
-        theta6 = 50.0
-        return [theta1, theta2, theta3, theta4, theta5, theta6]
+        return [theta1, theta2, theta3, theta4, theta5, float(theta6)]
+
+    @staticmethod
+    def _measure_gripper_width(sel_mask, wrist_roll, gripper_tip) -> float | None:
+        """Measure the mask's perpendicular extent in an 18 px tip band."""
+        try:
+            if np is None:
+                return None
+            start = np.asarray(wrist_roll, dtype=float)
+            tip = np.asarray(gripper_tip, dtype=float)
+            axis = tip - start
+            length = float(np.linalg.norm(axis))
+            if length <= 0.0:
+                return None
+            axis /= length
+            normal = np.asarray((-axis[1], axis[0]), dtype=float)
+            ys, xs = np.where(np.asarray(sel_mask) > 0)
+            if xs.size == 0:
+                return None
+            offsets = np.column_stack((xs.astype(float) - tip[0], ys.astype(float) - tip[1]))
+            along = offsets @ axis
+            in_band = np.abs(along) <= 18.0
+            if not np.any(in_band):
+                return None
+            perpendicular = offsets[in_band] @ normal
+            return float(perpendicular.max() - perpendicular.min() + 1.0)
+        except Exception:
+            return None
+
+    def _stabilize_gripper_width(self, width_px: float | None) -> float | None:
+        """Apply the same five-sample median and EMA used for keypoints."""
+        if width_px is None:
+            return None
+        self._gripper_width_history.append(float(width_px))
+        self._gripper_width_history = self._gripper_width_history[-5:]
+        ordered = sorted(self._gripper_width_history)
+        median = ordered[len(ordered) // 2]
+        previous = self._smoothed_gripper_width_px
+        smoothed = median if previous is None else 0.15 * median + 0.85 * previous
+        self._smoothed_gripper_width_px = float(smoothed)
+        return float(smoothed)
 
     def _resample(self, points, n):
         if not points:
@@ -449,6 +492,8 @@ class ArmVisionAnalyzer:
                 self._prev_keypoints_px = None
                 self._prev_mask_centroid = None
                 self._macro_jump_streak = 0
+                self._gripper_width_history = []
+                self._smoothed_gripper_width_px = None
             self._prev_frame_shape = current_shape
 
         # Track mask centroid to detect macro jumps / test image changes
@@ -846,6 +891,13 @@ class ArmVisionAnalyzer:
                 min(max(float(tip[1]), 8.0), frame_h - 8.0),
             )
             theta5 = self._estimate_wrist_roll(hsv, wrist_roll, tip, (ux, uy))
+            grip_width_px = self._stabilize_gripper_width(
+                self._measure_gripper_width(sel_mask, wrist_roll, tip)
+            )
+            grip_open_percent = (
+                min(100.0, max(0.0, 100.0 * grip_width_px / self.gripper_max_width_px))
+                if grip_width_px is not None else None
+            )
         else:
             # Eight continuous horizontal-band centroids form a stable medial
             # polyline for straight and single-bend silhouettes.
@@ -864,6 +916,8 @@ class ArmVisionAnalyzer:
             base, shoulder, elbow, wrist_pitch, wrist_roll, tip = [
                 samples[int(round(fraction * 100))] for fraction in fractions
             ]
+            grip_width_px = None
+            grip_open_percent = None
         kp = {
             "base": (float(base[0]), float(base[1]), 0.8),
             "shoulder": (float(shoulder[0]), float(shoulder[1]), 0.8),
@@ -889,7 +943,9 @@ class ArmVisionAnalyzer:
             theta1_bev = self._estimate_base_theta1_bev(frame, sel_mask, kp, link_lengths)
         except Exception:
             theta1_bev = 0.0
-        thetas = self._derive_angles(kp)
+        thetas = self._derive_angles(
+            kp, theta6=grip_open_percent if is_arch and grip_open_percent is not None else 50.0
+        )
         if thetas is None:
             return None
         if isinstance(thetas, list) and len(thetas) >= 1:
@@ -897,7 +953,7 @@ class ArmVisionAnalyzer:
         if is_arch:
             thetas[4] = theta5
         thetas = self._clamp(thetas)
-        return thetas, kp, blue_area, 5
+        return thetas, kp, blue_area, 5, grip_width_px, grip_open_percent
 
     def _skeleton(self, kp):
         if not kp:
@@ -929,6 +985,8 @@ class ArmVisionAnalyzer:
             "skeleton": [],
             "cartesian_mm": None,
             "T_0_6": None,
+            "gripper_width_px": None,
+            "gripper_open_percent": None,
             "confidence": 0.0,
             "latency_ms": float(latency),
             "debug": {
@@ -994,6 +1052,8 @@ class ArmVisionAnalyzer:
             thetas = None
             kp = None
             joints = 0
+            gripper_width_px = None
+            gripper_open_percent = None
 
             if aruco_kp is not None:
                 ang = self._derive_angles(aruco_kp)
@@ -1012,7 +1072,7 @@ class ArmVisionAnalyzer:
                     joints = len(neural_kp)
 
             if chosen_mode is None and geom is not None:
-                g_thetas, g_kp, g_blue, g_joints = geom
+                g_thetas, g_kp, g_blue, g_joints, gripper_width_px, gripper_open_percent = geom
                 chosen_mode = "geometric"
                 thetas = g_thetas
                 kp = g_kp
@@ -1057,6 +1117,8 @@ class ArmVisionAnalyzer:
                 "skeleton": skeleton,
                 "cartesian_mm": cartesian,
                 "T_0_6": T,
+                "gripper_width_px": gripper_width_px,
+                "gripper_open_percent": gripper_open_percent,
                 "confidence": float(conf),
                 "latency_ms": float(latency),
                 "debug": {
@@ -1065,6 +1127,8 @@ class ArmVisionAnalyzer:
                     "camera_tilt_deg": round(float(getattr(self, "_camera_tilt_deg", 0.0)), 2),
                     "turntable_ellipse_ratio": round(float(getattr(self, "_turntable_ellipse_ratio", 0.0)), 4),
                     "camera_tilt_optimal": bool(getattr(self, "_camera_tilt_optimal", False)),
+                    "gripper_width_px": gripper_width_px,
+                    "gripper_open_percent": gripper_open_percent,
                 },
             }
         except Exception:

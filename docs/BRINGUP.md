@@ -36,10 +36,17 @@ The pre-power audit warms the camera for 2 seconds and allows up to 6 audit atte
 
 Every path ends with `S`.
 
-## Failure statuses
-- `ABORT_AUDIT`: Phase 1 audit failed (variance too high, not enough consecutive passes). Do not enable outputs. Check camera framing, lighting, marker visibility.
-- `ABORT_PROBE`: Probe pulse did not produce expected motion/direction response. Hold in safe state, verify wiring/power, do not proceed.
-- `NO_MOTION`: No motion detected during burst/probe. Check servo power, channel wiring, horn attachment, stop pulse calibration.
+`--dry-run` captures the optical baseline and reports the audit, but audit failure does not block a command preview; it never writes serial commands or changes OE.
+
+## Statuses
+| Status | Meaning |
+| --- | --- |
+| `ABORT_AUDIT` | Phase 1 audit failed (variance too high, not enough consecutive passes). Do not enable outputs. Check camera framing, lighting, marker visibility. |
+| `ABORT_PROBE` | Probe pulse did not produce expected motion/direction response. Hold in safe state, verify wiring/power, do not proceed. |
+| `COMMANDED_UNVERIFIED` | Command applied and acknowledged, vision cannot observe that axis; check it by eye. In particular, a steady gripper-width proxy cannot confirm Motor 1 movement. |
+| `NO_MOTION` | No motion detected during burst/probe on an observable joint. Check servo power, channel wiring, horn attachment, stop pulse calibration. |
+
+Motor 1's gripper check uses the measured mask width; `--min-gripper-px` sets the minimum change that counts as visually verified (default: 3 px). An unchanged proxy reports `COMMANDED_UNVERIFIED`, not `NO_MOTION`.
 
 ## Physical link proportions (reference)
 Used by skeleton: L1=115, L2=145, L3=135, L4=55, d5=45, L6=75 mm. `WRIST_R` locked 55 mm after `WRIST_P` (inside the U-fork, before the brass standoffs), `GRIPPER` 120 mm after `WRIST_R`.

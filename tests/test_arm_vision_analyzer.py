@@ -33,6 +33,8 @@ def test_geometric_blue_arm():
     assert r["mode_used"] == "geometric"
     assert r["thetas_deg"] is not None and len(r["thetas_deg"]) == 6
     assert len(r["skeleton"]) >= 5
+    assert r["thetas_deg"][5] == 50.0
+    assert r["gripper_width_px"] is None
     assert r["confidence"] > 0.3
     assert r["latency_ms"] > 0
 
@@ -165,6 +167,17 @@ def test_local_mask_centroid_ignores_pixels_outside_radius():
     centroid = analyzer._local_mask_centroid(mask, (50.0, 50.0))
 
     assert centroid == (50.0, 50.0)
+
+
+def test_gripper_width_measures_mask_extent_perpendicular_to_tip_axis():
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[40:61, 32:51] = 255
+
+    width = ArmVisionAnalyzer._measure_gripper_width(
+        mask, wrist_roll=(10.0, 50.0), gripper_tip=(50.0, 50.0)
+    )
+
+    assert width == 21.0
 
 
 def test_keypoint_smoothing_uses_ema_and_resets_large_jumps():

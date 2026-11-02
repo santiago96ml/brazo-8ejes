@@ -33,6 +33,7 @@ class FakeEncoder:
         self.audit_variance = audit_variance
         self.audit_calls = 0
         self.angle = 30.0
+        self.gripper_width_px = 50.0
         self.oe_high = True
 
     def audit_pre_power(self, camera, num_frames, max_variance_deg):
@@ -51,6 +52,9 @@ class FakeEncoder:
 
     def read_positions(self, frame):
         return {
+            "mode_used": "aruco",
+            "gripper_width_px": self.gripper_width_px,
+            "gripper_open_percent": self.gripper_width_px / 120.0 * 100.0,
             "thetas_deg": [0.0, 90.0, 0.0, 0.0, 0.0, self.angle],
             "motors_deg": {1: self.angle, 2: 0.0, 3: 90.0, 4: 90.0, 5: 90.0, 6: 90.0, 7: 0.0},
         }
@@ -98,11 +102,24 @@ class ModeVarianceEncoder(FakeEncoder):
             "max_variance_deg2": variance,
         }
 
+
+class GeometricFallbackEncoder(FakeEncoder):
+    def audit_pre_power(self, camera, num_frames, max_variance_deg):
+        result = super().audit_pre_power(camera, num_frames, max_variance_deg)
+        result["mode_used"] = "geometric_fallback"
+        return result
+
+    def read_positions(self, frame):
+        result = super().read_positions(frame)
+        result["mode_used"] = "geometric_fallback"
+        return result
+
 class FakeTransport:
-    def __init__(self, encoder=None, probe_motion=True):
+    def __init__(self, encoder=None, probe_motion=True, gripper_motion=True):
         self.commands = []
         self.encoder = encoder
         self.probe_motion = probe_motion
+        self.gripper_motion = gripper_motion
 
     def send_line(self, command):
         self.commands.append(command)
@@ -110,15 +127,18 @@ class FakeTransport:
             self.encoder.angle += 0.5
         elif command.startswith("T") and command.endswith(":400") and self.encoder:
             self.encoder.angle += 6.0
+            if self.gripper_motion:
+                self.encoder.gripper_width_px += 40.0
 
 
 class TestSingleMotorTest(unittest.TestCase):
     def run_test(self, **kwargs):
         camera = FakeCamera()
+        motor = kwargs.pop("motor", 1)
         encoder = kwargs.pop("encoder", FakeEncoder())
         transport = kwargs.pop("transport", FakeTransport(encoder))
         result = run_single_motor_test(
-            motor=1,
+            motor=motor,
             frames=3,
             delta_deg=8.0,
             burst_ms=400,
@@ -270,9 +290,10 @@ class TestSingleMotorTest(unittest.TestCase):
     def test_auto_aruco_limit_rejects_variance_three(self):
         result, transport = self._run_mode_limit_test("aruco", 3.0)
 
-        self.assertEqual(result["status"], "ABORT_AUDIT")
+        self.assertEqual(result["status"], "OK")
         self.assertEqual(result["variance_limit_deg2"], 1.5)
         self.assertEqual(result["variance_limit_source"], "auto_aruco")
+        self.assertFalse(result["audit"]["passed"])
         self.assertNotIn("R", transport.commands)
 
     def test_cli_variance_override_and_strict_limit_sources(self):
@@ -286,9 +307,10 @@ class TestSingleMotorTest(unittest.TestCase):
         self.assertEqual(cli_result["status"], "OK")
         self.assertEqual(cli_result["variance_limit_deg2"], 3.5)
         self.assertEqual(cli_result["variance_limit_source"], "cli")
-        self.assertEqual(strict_result["status"], "ABORT_AUDIT")
+        self.assertEqual(strict_result["status"], "OK")
         self.assertEqual(strict_result["variance_limit_deg2"], 1.5)
         self.assertEqual(strict_result["variance_limit_source"], "strict")
+        self.assertFalse(strict_result["audit"]["passed"])
 
     def test_encoder_auto_limit_uses_detected_mode(self):
         def run_audit(mode):
@@ -351,8 +373,46 @@ class TestSingleMotorTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "OK")
         self.assertTrue(result["direction_ok"])
-        self.assertAlmostEqual(result["measured_delta_deg"], 6.0, delta=0.3)
+        self.assertIsNone(result["measured_delta_deg"])
+        self.assertAlmostEqual(result["measured_proxy"]["delta_px"], 40.0, delta=0.3)
         self.assertEqual(transport.commands[-1], "S")
+
+    def test_gripper_proxy_change_reports_ok_with_pixel_delta(self):
+        result, _camera, _encoder, _transport = self.run_test(motor=1)
+
+        self.assertEqual(result["status"], "OK")
+        self.assertIsNone(result["measured_delta_deg"])
+        self.assertEqual(result["measured_proxy"]["delta_px"], 40.0)
+
+    def test_unchanged_gripper_proxy_is_commanded_unverified(self):
+        camera = FakeCamera()
+        encoder = FakeEncoder()
+        transport = FakeTransport(encoder, gripper_motion=False)
+        result = run_single_motor_test(
+            motor=1, frames=3, camera=camera, encoder=encoder, transport=transport,
+        )
+
+        self.assertEqual(result["status"], "COMMANDED_UNVERIFIED")
+        self.assertEqual(result["reason"], "vision_cannot_observe_joint")
+        self.assertEqual(result["measured_proxy"]["delta_px"], 0.0)
+
+    def test_observable_motor_four_without_motion_reports_no_motion(self):
+        result, _camera, _encoder, _transport = self.run_test(
+            motor=4, transport=FakeTransport(FakeEncoder(), probe_motion=False),
+        )
+
+        self.assertEqual(result["status"], "NO_MOTION")
+
+    def test_unchanged_motor_two_geometric_fallback_is_commanded_unverified(self):
+        encoder = GeometricFallbackEncoder()
+        camera = FakeCamera()
+        transport = FakeTransport(encoder)
+        result = run_single_motor_test(
+            motor=2, frames=3, camera=camera, encoder=encoder, transport=transport,
+        )
+
+        self.assertEqual(result["status"], "COMMANDED_UNVERIFIED")
+        self.assertEqual(result["reason"], "vision_cannot_observe_joint")
 
 
 if __name__ == "__main__":
