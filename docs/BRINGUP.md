@@ -32,6 +32,8 @@ Use `tools/single_motor_test.py` (conceptual procedure). The sequence is:
 6. **Brake/stop** - Return to safe state.
 7. **S** - End with `S` (estop) which drives all channels to stop pulse and raises `OE` (removes PWM).
 
+The pre-power audit warms the camera for 2 seconds and allows up to 6 audit attempts to obtain 3 consecutive valid passes. Override the limit with `--max-audit-attempts` when needed; the variance gate remains `< 1.5 deg²`.
+
 Every path ends with `S`.
 
 ## Failure statuses

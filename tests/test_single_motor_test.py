@@ -55,6 +55,24 @@ class FakeEncoder:
     def set_oe_state(self, oe_high=True, active_command=False):
         self.oe_high = oe_high
 
+
+class SequenceAuditEncoder(FakeEncoder):
+    def __init__(self, variances):
+        super().__init__()
+        self.variances = list(variances)
+
+    def audit_pre_power(self, camera, num_frames, max_variance_deg):
+        variance = self.variances[self.audit_calls]
+        self.audit_calls += 1
+        return {
+            "passed": variance < max_variance_deg,
+            "frames_evaluated": num_frames,
+            "mode_used": "aruco",
+            "visible_marker_ids": [0, 1, 2, 3, 4, 5],
+            "variances_deg2": [variance] * 6,
+            "max_variance_deg2": variance,
+        }
+
 class FakeTransport:
     def __init__(self, encoder=None, probe_motion=True):
         self.commands = []
@@ -120,7 +138,7 @@ class TestSingleMotorTest(unittest.TestCase):
             empty_audits_remaining = 2
 
             def get_latest_frame(self):
-                if clock["now"] >= 1.2 and self.empty_audits_remaining:
+                if clock["now"] >= 2.0 and self.empty_audits_remaining:
                     self.empty_audits_remaining -= 1
                     self.timestamp += 1
                     return None, self.timestamp, 30.0
@@ -160,10 +178,37 @@ class TestSingleMotorTest(unittest.TestCase):
         self.assertEqual(encoder.audit_calls, 5)
         self.assertEqual(result["decision_gate"]["consecutive_passes"], 3)
         self.assertEqual(len(result["decision_gate"]["audit_results"]), 3)
-        self.assertEqual(result["audit"]["frames_evaluated"], [3, 3, 3])
+        self.assertEqual(result["audit"]["frames_evaluated"], [0, 0, 3, 3, 3])
+        self.assertEqual(result["audit_attempts"], 5)
         self.assertEqual(result["port_used"], "COM8")
         self.assertEqual(result["status"], "OK")
         self.assertEqual(result["oe_sequence"], [])
+
+    def test_sliding_audit_window_recovers_after_initial_failure(self):
+        encoder = SequenceAuditEncoder([9.0, 0.1, 0.1, 0.1])
+        result, _camera, _encoder, transport = self.run_test(
+            encoder=encoder, max_audit_attempts=6,
+        )
+
+        self.assertEqual(result["status"], "OK")
+        self.assertEqual(result["audit_attempts"], 4)
+        self.assertEqual(result["decision_gate"]["consecutive_passes"], 3)
+        self.assertEqual(
+            [item["passed"] for item in result["audit"]["results"]],
+            [False, True, True, True],
+        )
+        self.assertIn("R", transport.commands)
+
+    def test_sliding_audit_window_aborts_after_all_attempts_fail(self):
+        encoder = SequenceAuditEncoder([9.0] * 6)
+        result, _camera, _encoder, transport = self.run_test(
+            encoder=encoder, max_audit_attempts=6,
+        )
+
+        self.assertEqual(result["status"], "ABORT_AUDIT")
+        self.assertEqual(result["audit_attempts"], 6)
+        self.assertEqual(result["decision_gate"]["consecutive_passes"], 0)
+        self.assertNotIn("R", transport.commands)
 
     def test_failed_audit_aborts_without_enabling_oe(self):
         encoder = FakeEncoder(audit_variance=9.0)
