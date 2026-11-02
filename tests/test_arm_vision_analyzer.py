@@ -114,6 +114,48 @@ def test_geometric_keypoint_ema_uses_15_percent_median_when_mask_is_stable():
     assert smoothed["base"] == (0.3, 0.3, 0.8)
 
 
+def test_single_and_double_centroid_jumps_preserve_five_frame_history():
+    analyzer = ArmVisionAnalyzer(mode="geometric")
+    stable = {
+        name: (float(index * 10), float(index * 10), 0.8)
+        for index, name in enumerate(analyzer.KEYPOINT_ORDER)
+    }
+    for _ in range(3):
+        analyzer._smooth_keypoints(stable, (100.0, 100.0), (720, 1280))
+
+    outlier = {
+        name: (point[0] + 400.0, point[1] + 250.0, point[2])
+        for name, point in stable.items()
+    }
+    analyzer._smooth_keypoints(outlier, (500.0, 350.0), (720, 1280))
+    returned = analyzer._smooth_keypoints(stable, (100.0, 100.0), (720, 1280))
+
+    assert analyzer._macro_jump_streak == 2
+    assert len(analyzer._kp_history) == 5
+    assert returned["base"] == stable["base"]
+
+
+def test_three_consecutive_macro_jumps_and_frame_shape_change_reset_history():
+    analyzer = ArmVisionAnalyzer(mode="geometric")
+    keypoints = {
+        name: (float(index * 10), float(index * 10), 0.8)
+        for index, name in enumerate(analyzer.KEYPOINT_ORDER)
+    }
+    analyzer._smooth_keypoints(keypoints, (0.0, 0.0), (720, 1280))
+    for offset in (100.0, 200.0, 300.0):
+        shifted = {
+            name: (point[0] + offset, point[1], point[2])
+            for name, point in keypoints.items()
+        }
+        analyzer._smooth_keypoints(shifted, (offset, 0.0), (720, 1280))
+
+    assert len(analyzer._kp_history) == 1
+    changed_shape = analyzer._smooth_keypoints(keypoints, (300.0, 0.0), (480, 640))
+
+    assert len(analyzer._kp_history) == 1
+    assert changed_shape["base"] == keypoints["base"]
+
+
 def test_local_mask_centroid_ignores_pixels_outside_radius():
     analyzer = ArmVisionAnalyzer(mode="geometric")
     mask = np.zeros((120, 120), dtype=np.uint8)

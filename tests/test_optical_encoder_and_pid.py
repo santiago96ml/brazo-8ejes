@@ -243,6 +243,62 @@ def test_motor2_8deg_noise_oe_high_stays_passed():
     assert audit["secondary_max_variance_deg2"] < 0.5
 
 
+def test_zero_motion_lock_keeps_nine_frame_window_through_single_frame_outlier():
+    encoder = VirtualOpticalEncoder()
+    encoder.set_oe_state(oe_high=True, active_command=False)
+    for _ in range(9):
+        encoder._filter_joint_window([0.0] * 6)
+    encoder._prev_raw_thetas = [0.0] * 6
+
+    filtered = encoder._filter_joint_window([90.0] * 6)
+
+    assert len(encoder._raw_window) == 9
+    assert filtered == [0.0] * 6
+    assert encoder._filter_joint_window([0.0] * 6) == [0.0] * 6
+
+
+def test_powered_filter_resets_only_after_five_persistent_macro_jumps():
+    encoder = VirtualOpticalEncoder()
+    encoder.set_oe_state(oe_high=False, active_command=True)
+    for _ in range(9):
+        encoder._filter_joint_window([0.0] * 6)
+
+    for _ in range(4):
+        encoder._filter_joint_window([100.0] * 6)
+        assert len(encoder._raw_window) == 9
+    encoder._filter_joint_window([100.0] * 6)
+
+    assert len(encoder._raw_window) == 1
+
+
+def test_pre_power_audit_rejects_one_frame_iqr_outlier_before_variance():
+    encoder = VirtualOpticalEncoder()
+    frames = [np.zeros((1, 1, 3), dtype=np.uint8) for _ in range(40)]
+    call_count = 0
+
+    def read_positions(_frame, timestamp_s=None):
+        nonlocal call_count
+        call_count += 1
+        thetas = [0.0] * 6
+        windowed_thetas = [0.0] * 6
+        if call_count > 10:
+            thetas[0] = float((call_count - 10) * 4)
+        if call_count == 16:
+            windowed_thetas[0] = 120.0
+        encoder._last_window_thetas = windowed_thetas
+        return {
+            "thetas_deg": thetas,
+            "mode_used": "geometric_fallback",
+            "visible_marker_ids": [],
+        }
+
+    encoder.read_positions = read_positions
+    audit = encoder.audit_pre_power(frames, num_frames=30)
+
+    assert audit["resting_thetas_deg"][0] == 0.0
+    assert audit["variances_deg2"][0] == 0.0
+
+
 def test_decision_gate_3_consecutive_passes_and_40ms_probe():
     gate = DecisionGate()
 

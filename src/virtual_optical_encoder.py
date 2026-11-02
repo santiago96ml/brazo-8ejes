@@ -79,6 +79,9 @@ class VirtualOpticalEncoder:
         self.active_command = False
         self._raw_window: list[list[float]] = []
         self._prev_raw_thetas: Optional[list[float]] = None
+        self._jump_reference_thetas: Optional[list[float]] = None
+        self._jump_streak = 0
+        self._last_window_thetas: Optional[list[float]] = None
 
         # ArUco setup
         self._aruco_dict = None
@@ -151,6 +154,21 @@ class VirtualOpticalEncoder:
         self.oe_high = bool(oe_high)
         self.active_command = bool(active_command)
 
+    def reset_filter(self) -> None:
+        """Clear temporal angle-filter state before a new acquisition window."""
+        self._theta_filt = [0.0] * 6
+        self._prev_thetas = None
+        self._omega_vis = [0.0] * 6
+        self._last_t = None
+        self._initialized = False
+        self._thetas_raw_history = []
+        self._theta_filt_prev = None
+        self._raw_window = []
+        self._prev_raw_thetas = None
+        self._jump_reference_thetas = None
+        self._jump_streak = 0
+        self._last_window_thetas = None
+
     @staticmethod
     def _median(values: list[float]) -> float:
         ordered = sorted(values)
@@ -172,16 +190,25 @@ class VirtualOpticalEncoder:
     def _filter_joint_window(self, thetas_raw: list[float]) -> list[float]:
         """Reject per-joint window outliers using circular IQR and recency weights."""
         raw = [float(value) for value in thetas_raw]
-        if self._prev_raw_thetas is not None:
-            primary_jumps = [
-                abs(_wrap_deg(raw[i] - self._prev_raw_thetas[i])) > 60.0
-                for i in range(4)
-            ]
-            if all(primary_jumps):
-                self._raw_window.clear()
-                # A wholly new pose (common in synthetic tests and camera
-                # reacquisition) must not inherit the prior EMA state.
-                self._theta_filt_prev = None
+        if self._jump_reference_thetas is None:
+            self._jump_reference_thetas = list(raw)
+        macro_jump = any(
+            abs(_wrap_deg(raw[i] - self._jump_reference_thetas[i])) > 60.0
+            for i in range(4)
+        )
+        zero_motion_lock = self.oe_high and not self.active_command
+        if macro_jump and not zero_motion_lock:
+            self._jump_streak += 1
+        else:
+            self._jump_streak = 0
+            if not macro_jump:
+                self._jump_reference_thetas = list(raw)
+        if not zero_motion_lock and self._jump_streak >= 5:
+            self._raw_window.clear()
+            # A sustained new pose must not inherit the previous EMA state.
+            self._theta_filt_prev = None
+            self._jump_reference_thetas = list(raw)
+            self._jump_streak = 0
         self._raw_window.append(raw)
         if len(self._raw_window) > 9:
             del self._raw_window[:-9]
@@ -405,6 +432,7 @@ class VirtualOpticalEncoder:
                         thetas_raw[joint] = float(self._prev_thetas[joint])
 
         thetas_window = self._filter_joint_window(thetas_raw)
+        self._last_window_thetas = list(thetas_window)
         # Filtering
         now = timestamp_s
         # Push raw to history for median-of-5 in geometric fallback
@@ -508,15 +536,7 @@ class VirtualOpticalEncoder:
 
     def audit_pre_power(self, frames_iterable_or_camera, num_frames: int = 30, max_variance_deg: float = 0.15, require_all_aruco: bool = False) -> dict:
         # Start every audit from a clean filter state before consuming frames.
-        self._theta_filt = [0.0] * 6
-        self._prev_thetas = None
-        self._omega_vis = [0.0] * 6
-        self._last_t = None
-        self._initialized = False
-        self._thetas_raw_history = []
-        self._theta_filt_prev = None
-        self._raw_window = []
-        self._prev_raw_thetas = None
+        self.reset_filter()
         self.oe_high = True
         self.active_command = False
         requested_frames = max(0, int(num_frames))
@@ -593,19 +613,17 @@ class VirtualOpticalEncoder:
             self.read_positions(frame, timestamp_s=start_time + i * 0.033)
         # Warm-up is for camera/analyzer settling, not for carrying startup
         # transients into the measured audit window.
-        self._theta_filt = [0.0] * 6
-        self._prev_thetas = None
-        self._omega_vis = [0.0] * 6
-        self._last_t = None
-        self._initialized = False
-        self._thetas_raw_history = []
-        self._theta_filt_prev = None
-        self._raw_window = []
-        self._prev_raw_thetas = None
+        self.reset_filter()
         results = []
+        windowed_results = []
         for i, f in enumerate(evaluation_frames):
             r = self.read_positions(f, timestamp_s=start_time + (len(warmup_frames) + i) * 0.033)
             results.append(r)
+            windowed_results.append(
+                list(self._last_window_thetas)
+                if self._last_window_thetas is not None
+                else None
+            )
             if require_all_aruco:
                 vis = set(r.get("visible_marker_ids", []))
                 if not ({0, 1, 2, 3, 4, 5}.issubset(vis)):
@@ -614,9 +632,11 @@ class VirtualOpticalEncoder:
         # Collect angles
         thetas_series = [[] for _ in range(6)]
         modes = []
-        for r in results:
+        for result_index, r in enumerate(results):
             modes.append(r.get("mode_used"))
-            th = r.get("thetas_deg", [0.0] * 6)
+            th = windowed_results[result_index]
+            if th is None:
+                th = r.get("thetas_deg", [0.0] * 6)
             for i in range(6):
                 thetas_series[i].append(float(th[i]) if i < len(th) else 0.0)
 
@@ -629,9 +649,23 @@ class VirtualOpticalEncoder:
                 means.append(0.0)
                 variances.append(999.0)
                 continue
-            m = sum(arr) / len(arr)
-            var = sum((x - m) ** 2 for x in arr) / len(arr)
-            means.append(m)
+            if self.oe_high and not self.active_command:
+                reference = arr[0]
+                values = [reference + _wrap_deg(value - reference) for value in arr]
+                median = self._median(values)
+                offsets = [value - median for value in values]
+                q1 = self._percentile(offsets, 0.25)
+                q3 = self._percentile(offsets, 0.75)
+                limit = max(1.5 * (q3 - q1), 0.35)
+                values = [
+                    median if abs(value - median) > limit else value
+                    for value in values
+                ]
+            else:
+                values = arr
+            mean = sum(values) / len(values)
+            var = sum((value - mean) ** 2 for value in values) / len(values)
+            means.append(_wrap_deg(mean))
             variances.append(var)
 
         variances = [value if math.isfinite(value) else 999.0 for value in variances]

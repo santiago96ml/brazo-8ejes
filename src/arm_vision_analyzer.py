@@ -175,6 +175,8 @@ class ArmVisionAnalyzer:
         self._prev_keypoints_px = None
         self._kp_history = []
         self._prev_mask_centroid = None
+        self._macro_jump_streak = 0
+        self._prev_frame_shape = None
         self._link_lengths_mm = None
         self._prev_theta1 = None
         self._camera_tilt_deg = 0.0
@@ -433,18 +435,38 @@ class ArmVisionAnalyzer:
             float(y0 + moments["m01"] / moments["m00"]),
         )
 
-    def _smooth_keypoints(self, keypoints: dict, mask_centroid: tuple[float, float] | None = None) -> dict:
+    def _smooth_keypoints(
+        self,
+        keypoints: dict,
+        mask_centroid: tuple[float, float] | None = None,
+        frame_shape: tuple[int, ...] | None = None,
+    ) -> dict:
         """Apply rolling median (5) + EMA keypoint stabilization."""
+        if frame_shape is not None:
+            current_shape = tuple(frame_shape)
+            if self._prev_frame_shape is not None and current_shape != self._prev_frame_shape:
+                self._kp_history = []
+                self._prev_keypoints_px = None
+                self._prev_mask_centroid = None
+                self._macro_jump_streak = 0
+            self._prev_frame_shape = current_shape
+
         # Track mask centroid to detect macro jumps / test image changes
         if mask_centroid is not None:
             cx, cy = float(mask_centroid[0]), float(mask_centroid[1])
             if self._prev_mask_centroid is not None:
                 mcx, mcy = self._prev_mask_centroid
                 if math.hypot(cx - mcx, cy - mcy) > 80.0:
-                    # Large macro jump or synthetic image change -> clear history
-                    self._kp_history = []
-                    self._prev_keypoints_px = None
+                    self._macro_jump_streak += 1
+                    if self._macro_jump_streak >= 3:
+                        self._kp_history = []
+                        self._prev_keypoints_px = None
+                        self._macro_jump_streak = 0
+                else:
+                    self._macro_jump_streak = 0
             self._prev_mask_centroid = (cx, cy)
+        else:
+            self._macro_jump_streak = 0
 
         # Push current raw keypoints into history
         raw_px = {}
@@ -861,7 +883,7 @@ class ArmVisionAnalyzer:
                 mask_centroid = None
         except Exception:
             mask_centroid = None
-        kp = self._smooth_keypoints(kp, mask_centroid)
+        kp = self._smooth_keypoints(kp, mask_centroid, frame.shape)
         link_lengths = self._load_link_lengths()
         try:
             theta1_bev = self._estimate_base_theta1_bev(frame, sel_mask, kp, link_lengths)
