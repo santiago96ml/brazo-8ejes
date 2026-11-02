@@ -248,6 +248,8 @@ class VirtualOpticalEncoder:
             return markers_info
         try:
             for c, idv in zip(corners, ids.flatten()):
+                if not (0 <= int(idv) <= 6):
+                    continue
                 c4 = c.reshape(4, 2)
                 # corners order: [tl, tr, br, bl] in general; use as-is
                 tl = c4[0]

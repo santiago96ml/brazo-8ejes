@@ -726,15 +726,37 @@ class ArmVisionAnalyzer:
             shoulder_region = sel_mask[shoulder_y0:shoulder_y1, split_x + 1:bx + bw]
             shoulder = centroid(shoulder_region, split_x + 1, shoulder_y0)
 
-            wrist_y0 = max(by, int(ay + 0.25 * bh))
-            wrist_y1 = min(by + bh, int(ay + 0.72 * bh))
-            wrist_region = sel_mask[wrist_y0:wrist_y1, bx:split_x]
-            wrist_pitch = centroid(wrist_region, bx, wrist_y0)
+            if shoulder is None:
+                return None
 
-            roll_y0 = max(by, int(ay + 0.65 * bh))
-            roll_region = sel_mask[roll_y0:by + bh, bx:split_x]
-            wrist_roll = centroid(roll_region, bx, roll_y0)
-            if shoulder is None or wrist_pitch is None or wrist_roll is None:
+            # The broad turntable cylinder can cross left of the elbow. Remove
+            # its lower region before measuring the forearm, while preserving
+            # lowered forearms that extend farther left than the cylinder.
+            y_cylinder_top = max(0, min(frame_h, int(math.floor(shoulder[1] - 15.0))))
+            x_cylinder_start = max(0, min(split_x, bx + int(0.22 * bw)))
+            left_forearm_mask = sel_mask[:, :split_x].copy()
+            left_forearm_mask[y_cylinder_top:, x_cylinder_start:] = 0
+            left_ys, left_xs = np.where(left_forearm_mask > 0)
+            if left_xs.size == 0:
+                return None
+
+            x_left_min = int(left_xs.min())
+            x_span = float(split_x - x_left_min)
+            if x_span <= 0.0:
+                return None
+
+            # Use longitudinal mask bands rather than broad vertical slices:
+            # they follow both raised and lowered forearms without sampling the
+            # base cylinder's large pixel mass.
+            tip_x1 = min(split_x, int(math.floor(x_left_min + 0.25 * x_span)) + 1)
+            distal_tip = centroid(left_forearm_mask[:, x_left_min:tip_x1], x_left_min, 0)
+
+            wrist_x0 = max(x_left_min, int(math.floor(x_left_min + 0.35 * x_span)))
+            wrist_x1 = min(split_x, int(math.ceil(x_left_min + 0.72 * x_span)) + 1)
+            wrist_pitch = centroid(
+                left_forearm_mask[:, wrist_x0:wrist_x1], wrist_x0, 0
+            ) if wrist_x0 < wrist_x1 else None
+            if wrist_pitch is None or distal_tip is None:
                 return None
 
             below_y0 = min(frame_h, max(0, int(math.floor(shoulder[1] + 40.0))))
@@ -750,8 +772,8 @@ class ArmVisionAnalyzer:
             # The distal mask centroid indicates the wrist-to-gripper direction,
             # but it is not the wrist-roll joint: Motor 2 sits inside the U-fork,
             # before the brass standoffs and Motor 1's servo casing.
-            distal_target = np.asarray(wrist_roll, dtype=float)
             raw_wrist_pitch = np.asarray(wrist_pitch, dtype=float)
+            distal_target = np.asarray(distal_tip, dtype=float)
             distal_vector = distal_target - raw_wrist_pitch
             distal_length = float(np.linalg.norm(distal_vector))
             if distal_length <= 0.0:
