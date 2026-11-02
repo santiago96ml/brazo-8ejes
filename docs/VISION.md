@@ -208,6 +208,11 @@ python -m pip install --index-url https://download.pytorch.org/whl/cu126 --no-de
 `models/arm_keypoints.pt`. A generic COCO `yolo11n-pose.pt` is never auto-loaded:
 its keypoints are human joints and would silently poison `mode="hybrid"`.
 
+## Operational vs strict gate
+
+- **Operational gate (geometric/bring-up):** `max_variance_deg2 < 1.5` is the operational gate used by `DecisionGate` during Phase 1 pre-power audit. This allows progression to `R` after 3 consecutive passes.
+- **Strict/ArUco-grade target:** `0.15 deg^2` (`--strict`) is the metrology-grade target when using ArUco markers. It is **not required in geometric mode**; geometric mode is for bring-up supervision only because the distal wrist segment amplifies noise. For accurate angle measurements, use ArUco (IDs 0..6).
+
 ## Keyboard jog (teleoperation)
 
 | Key | Action |

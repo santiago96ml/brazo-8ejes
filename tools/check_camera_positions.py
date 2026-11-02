@@ -171,7 +171,19 @@ def main(argv: list[str] | None = None) -> int:
         default="tools/camera_previews/optical_encoder_audit.jpg",
         help="Path to save annotated snapshot",
     )
+    parser.add_argument(
+        "--max-variance",
+        type=float,
+        default=1.5,
+        help="Operational variance gate in deg^2 (default 1.5, as required by the actuation gate)",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Use the strict 0.15 deg^2 ArUco-grade threshold instead of 1.5",
+    )
     args = parser.parse_args(argv)
+    max_variance = 0.15 if args.strict else float(args.max_variance)
 
     encoder = VirtualOpticalEncoder()
     kinematics = RobotArm6DOF()
@@ -223,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
 
             # Run pre-power audit
             try:
-                audit_res = encoder.audit_pre_power(cam, num_frames=args.frames, max_variance_deg=0.15)
+                audit_res = encoder.audit_pre_power(cam, num_frames=args.frames, max_variance_deg=max_variance)
             except Exception as e:
                 audit_res = {
                     "passed": False,

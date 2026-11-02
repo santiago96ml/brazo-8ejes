@@ -158,4 +158,12 @@ The bridge is byte-transparent: same protocol, no changes on the host side.
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) - full serial command reference
 - [docs/CALIBRATION.md](docs/CALIBRATION.md) - mode detection, stop points, limits, shoulder pairing
 - [docs/MECHANICS.md](docs/MECHANICS.md) - source model, original wiring and what changed here
+- [docs/PHASE1_OPTICAL_AUDIT.md](docs/PHASE1_OPTICAL_AUDIT.md) - Phase 1 optical encoder + pre-power audit (1.5 deg^2 operational gate)
+- [docs/BRINGUP.md](docs/BRINGUP.md) - single-motor bring-up procedure, top-down
 - [odd/tasks/8axis-arm.md](odd/tasks/8axis-arm.md) - specification, tasks and decision log
+
+## Current status / roadmap
+
+- **Phase 1 complete:** Optical encoder + pre-power audit with operational gate **1.5 deg^2** (`--max-variance` default). DecisionGate requires **3 consecutive passes** with `var < 1.5` before `R`; a 40 ms probe pulse verifies direction when variance is moderate. Every path ends with `S`. Servos remain OFF (`OE=HIGH`) during audit.
+- **Bring-up:** Single-motor, top-down order - Motor 1 PINZA -> 2 GIRO_PINZA -> 3 INCLINA_PINZA -> 4 CODO -> 5&6 HOMBRO (coupled) -> 7 BASE. Use `tools/single_motor_test.py` following the procedure in [docs/BRINGUP.md](docs/BRINGUP.md).
+- **Metrology:** ArUco (IDs 0..6) required for metrology-grade angles; geometric mode is for bring-up supervision only (distal segment amplifies noise). ArUco-grade strict target is **0.15 deg^2** (`--strict`), not the geometric-mode gate.
