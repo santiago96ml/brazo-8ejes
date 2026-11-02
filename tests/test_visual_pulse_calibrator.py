@@ -74,7 +74,7 @@ class _FakeAnalyzer:
         self.t += 1
         # keypoints move every frame when the joint is supposed to be moving;
         # stay perfectly still to model a joint parked at its stop pulse.
-        offset = (self.t % 10) if self.moving else 0
+        offset = (self.t * 12) if self.moving else 0
         kps = {}
         base_x = 40 + offset
         kps["base"] = (base_x, 200, 0.9)

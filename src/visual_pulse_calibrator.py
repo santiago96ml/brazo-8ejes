@@ -345,8 +345,9 @@ class VisualPulseCalibrator:
                 frames.append(f)
                 ress.append(r)
                 time.sleep(0.01)
-            # compute pixels/second displacement of the joint marker
-            disp_px_s = 0.0
+            # compute pixels/second displacement of the joint marker; with fewer
+            # than two samples there is no measurement, so it can never look "still"
+            disp_px_s = 1e6  # sentinel: no measurement -> never "still"
             if len(frames) >= 2:
                 try:
                     # track between first and last
@@ -356,7 +357,7 @@ class VisualPulseCalibrator:
                     dt = 0.25 if 0.25 > 0 else 1e-6
                     disp_px_s = dist / dt
                 except Exception:
-                    disp_px_s = float("inf")
+                    disp_px_s = 1e6
             samples_all.append({"pulse": pulse, "displacement_px_s": disp_px_s})
             if disp_px_s < best_disp - 1e-9:
                 best_disp = disp_px_s
