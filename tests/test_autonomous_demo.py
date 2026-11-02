@@ -210,3 +210,54 @@ def test_demo_tolerates_drift_and_runs_eight_steps_in_order(monkeypatch, capsys)
     assert report["steps"][2]["moves"][0]["drift_deg"] == 10
     assert ctrl.xyz_calls[0][0] == (150, 0, 400)
     assert ctrl.xyz_calls[0][1] == {"pitch_deg": 45.0, "grip_percent": 60.0}
+
+
+def test_demo_retries_only_the_timed_out_move_after_a_pulse_ack(monkeypatch, capsys):
+    class TimeoutThenRecoverController(FakeControllerOK):
+        def __init__(self, **_kwargs):
+            super().__init__()
+            self.delta_calls = []
+
+        def move_delta_openloop(self, joint_index, delta_deg, **_kwargs):
+            self.delta_calls.append((joint_index, delta_deg))
+            if len(self.delta_calls) == 1:
+                return {
+                    "ok": True,
+                    "reason": "verified",
+                    "commanded_deg": delta_deg,
+                    "measured_deg": delta_deg,
+                    "drift_deg": 0.0,
+                    "pulse_acknowledged": True,
+                }
+            if len(self.delta_calls) == 2:
+                return {
+                    "ok": False,
+                    "reason": "firmware STATE response timed out",
+                    "commanded_deg": delta_deg,
+                    "measured_deg": None,
+                    "drift_deg": None,
+                    "pulse_acknowledged": False,
+                }
+            return {
+                "ok": True,
+                "reason": "verified",
+                "commanded_deg": delta_deg,
+                "measured_deg": delta_deg,
+                "drift_deg": 0.0,
+                "pulse_acknowledged": True,
+            }
+
+    ctrl = TimeoutThenRecoverController()
+    sys.modules.pop("src.closed_loop_controller", None)
+    import src.closed_loop_controller as clc
+    monkeypatch.setattr(clc, "ClosedLoopArmController", lambda **_kwargs: ctrl)
+    sys.modules["src.closed_loop_controller"] = clc
+
+    rc = demo.main([])
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    report = json.loads(lines[-1])
+
+    assert rc == 0
+    assert "STEP 3/8 base_sweep retry_firmware_read" in lines
+    assert ctrl.delta_calls[:3] == [(0, 12.0), (0, -12.0), (0, -12.0)]
+    assert report["steps"][2]["ok"] is True

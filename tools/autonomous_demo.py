@@ -94,6 +94,7 @@ def _run_moves(controller, mode: str, moves: List[tuple[int, float]],
     tolerated_drift = False
     for joint_index, delta in moves:
         result = _move_delta(controller, mode, joint_index, delta, settle_s)
+        result["joint_index"] = joint_index
         results.append(result)
         if not result.get("ok"):
             if result.get("reason") == "drift":
@@ -119,6 +120,50 @@ def _run_moves(controller, mode: str, moves: List[tuple[int, float]],
     }
 
 
+def _summarize_moves(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    hard_failure = next((move for move in results
+                         if not move.get("ok") and move.get("reason") != "drift"), None)
+    drift = any(move.get("reason") == "drift" for move in results)
+    return {
+        "ok": hard_failure is None,
+        "reason": hard_failure.get("reason") if hard_failure else (
+            "drift" if drift else "completed"
+        ),
+        "status": "fail" if hard_failure else ("drift" if drift else "ok"),
+        "commanded_deg": [move.get("commanded_deg") for move in results],
+        "measured_deg": [move.get("measured_deg") for move in results],
+        "drift_deg": [move.get("drift_deg") for move in results],
+        "moves": results,
+    }
+
+
+def _retry_firmware_read(controller, mode: str, number: int, name: str,
+                         result: Dict[str, Any], prior_pulse_ack: bool = False
+                         ) -> Dict[str, Any]:
+    if result.get("ok") or result.get("reason") != "firmware STATE response timed out":
+        return result
+    moves = list(result.get("moves", []))
+    if not moves:
+        return result
+    failed = moves[-1]
+    acknowledged = prior_pulse_ack or failed.get("pulse_acknowledged", False) or any(
+        move.get("pulse_acknowledged", False) for move in moves[:-1]
+    )
+    joint_index = failed.get("joint_index")
+    if not acknowledged or joint_index is None:
+        return result
+
+    print(f"STEP {number}/{len(STEP_NAMES)} {name} retry_firmware_read")
+    retry = _move_delta(
+        controller,
+        mode,
+        int(joint_index),
+        float(failed["commanded_deg"]),
+    )
+    retry["joint_index"] = int(joint_index)
+    return {**result, **_summarize_moves(moves[:-1] + [retry])}
+
+
 def _move_absolute(controller, mode: str, joint_index: int, target_deg: float,
                    settle_s: float = 0.9) -> Dict[str, Any]:
     state = controller.read_state(wait_fresh=True, timeout_s=1.5)
@@ -131,7 +176,16 @@ def _move_absolute(controller, mode: str, joint_index: int, target_deg: float,
             "drift_deg": None,
         }
     delta = _wrap_deg(float(target_deg) - float(state["thetas_deg"][joint_index]))
-    return _move_delta(controller, mode, joint_index, delta, settle_s)
+    result = _move_delta(controller, mode, joint_index, delta, settle_s)
+    result["joint_index"] = joint_index
+    return result
+
+
+def _has_pulse_acknowledgement(result: Dict[str, Any]) -> bool:
+    if result.get("pulse_acknowledged"):
+        return True
+    return any(move.get("pulse_acknowledged", False)
+               for move in result.get("moves", []) if isinstance(move, dict))
 
 
 def _move_to_xyz(controller, mode: str) -> Dict[str, Any]:
@@ -305,6 +359,7 @@ def main(argv: List[str] | None = None) -> int:
     controller = None
     start = None
     return_attempted = False
+    pulse_ack_seen = False
     active_step = 1
     try:
         if args.dry_run:
@@ -347,21 +402,33 @@ def main(argv: List[str] | None = None) -> int:
         mode = args.control
         active_step = 3
         result = _run_moves(controller, mode, [(0, 12.0), (0, -12.0)])
+        result = _retry_firmware_read(
+            controller, mode, 3, STEP_NAMES[2], result, pulse_ack_seen
+        )
         _log_step(report, 3, STEP_NAMES[2], result)
         if not result["ok"]:
             raise RuntimeError(result.get("reason", "base_sweep_failed"))
+        pulse_ack_seen = pulse_ack_seen or _has_pulse_acknowledgement(result)
 
         active_step = 4
         result = _run_moves(controller, mode, [(1, 10.0), (1, -10.0)])
+        result = _retry_firmware_read(
+            controller, mode, 4, STEP_NAMES[3], result, pulse_ack_seen
+        )
         _log_step(report, 4, STEP_NAMES[3], result)
         if not result["ok"]:
             raise RuntimeError(result.get("reason", "shoulder_lift_failed"))
+        pulse_ack_seen = pulse_ack_seen or _has_pulse_acknowledgement(result)
 
         active_step = 5
         result = _run_moves(controller, mode, [(2, 10.0), (2, -10.0)])
+        result = _retry_firmware_read(
+            controller, mode, 5, STEP_NAMES[4], result, pulse_ack_seen
+        )
         _log_step(report, 5, STEP_NAMES[4], result)
         if not result["ok"]:
             raise RuntimeError(result.get("reason", "elbow_failed"))
+        pulse_ack_seen = pulse_ack_seen or _has_pulse_acknowledgement(result)
 
         active_step = 6
         salute_results = []
@@ -369,35 +436,44 @@ def main(argv: List[str] | None = None) -> int:
             move = _move_absolute(controller, mode, 5, target)
             salute_results.append(move)
             if not move.get("ok") and move.get("reason") != "drift":
+                result = _summarize_moves(salute_results)
+                result = _retry_firmware_read(
+                    controller, mode, 6, STEP_NAMES[5], result,
+                    pulse_ack_seen or _has_pulse_acknowledgement(
+                        {"moves": salute_results[:-1]}
+                    ),
+                )
+                salute_results = result.get("moves", salute_results)
+                if result.get("ok"):
+                    continue
                 break
-        salute_ok = all(
-            move.get("ok") or move.get("reason") == "drift"
-            for move in salute_results
-        ) and len(salute_results) == 3
-        salute_drift = any(move.get("reason") == "drift" for move in salute_results)
-        result = {
-            "ok": salute_ok,
-            "status": "drift" if salute_drift else ("ok" if salute_ok else "fail"),
-            "reason": "drift" if salute_drift else "completed",
-            "commanded_deg": [move.get("commanded_deg") for move in salute_results],
-            "measured_deg": [move.get("measured_deg") for move in salute_results],
-            "drift_deg": [move.get("drift_deg") for move in salute_results],
-            "moves": salute_results,
-        }
+        result = _summarize_moves(salute_results)
+        if len(salute_results) != 3 and result.get("ok"):
+            result["ok"] = False
+            result["status"] = "fail"
+            result["reason"] = "incomplete_gripper_salute"
         _log_step(report, 6, STEP_NAMES[5], result)
-        if not salute_ok:
-            raise RuntimeError("gripper_salute_failed")
+        if not result["ok"]:
+            raise RuntimeError(result.get("reason", "gripper_salute_failed"))
+        pulse_ack_seen = pulse_ack_seen or _has_pulse_acknowledgement(result)
 
         active_step = 7
         result = _move_to_xyz(controller, mode)
+        result = _retry_firmware_read(
+            controller, mode, 7, STEP_NAMES[6], result, pulse_ack_seen
+        )
         result["status"] = "ok" if result.get("ok") else "fail"
         _log_step(report, 7, STEP_NAMES[6], result, result.get("error_mm", 0.0))
         if not result.get("ok"):
             raise RuntimeError(result.get("reason", "move_to_xyz_failed"))
+        pulse_ack_seen = pulse_ack_seen or _has_pulse_acknowledgement(result)
 
         active_step = 8
         return_attempted = True
         result = _return_to_start(controller, mode, start)
+        result = _retry_firmware_read(
+            controller, mode, 8, STEP_NAMES[7], result, pulse_ack_seen
+        )
         result["status"] = "ok" if result.get("ok") else "fail"
         _log_step(report, 8, STEP_NAMES[7], result,
                   max((abs(value) for value in result.get("final_error_deg", [])

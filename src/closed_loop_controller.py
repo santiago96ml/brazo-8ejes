@@ -105,6 +105,7 @@ class ClosedLoopArmController:
         self._last_omega = [0.0] * 6
         self._last_frame_timestamp = None
         self.start_thetas_deg: list[float] | None = None
+        self._last_pulse_acknowledged = False
         self._last_sent_pulses = {
             motor: int(round(float(self.odometry._calib[motor]["pulse_stop"])))
             for motor in range(1, 8)
@@ -174,56 +175,129 @@ class ClosedLoopArmController:
         self._send(f"P{motor}:{int(pulse)}")
         self._last_sent_pulses[motor] = int(pulse)
 
+    @staticmethod
+    def _drain_replies(response_queue, timeout_s: float = 0.15) -> None:
+        if response_queue is None or not callable(getattr(response_queue, "get", None)):
+            return
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                response_queue.get(timeout=min(0.02, remaining))
+            except queue.Empty:
+                continue
+
+    def _firmware_state_from_reply(self, raw) -> dict | None:
+        try:
+            state = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            return None
+        if not isinstance(state, dict) or state.get("status") != "STATE":
+            return None
+
+        pulses: dict[int, int] = {}
+        motors = state.get("motors", state.get("ch", []))
+        for item in motors if isinstance(motors, list) else []:
+            if not isinstance(item, dict):
+                continue
+            motor = item.get("m")
+            channel = item.get("ch", item.get("c"))
+            if motor is None and channel is not None:
+                motor = int(channel) + 1
+            pulse = item.get("pulse", item.get("p"))
+            if motor is not None and pulse is not None:
+                pulses[int(motor)] = int(pulse)
+        if not pulses:
+            raise ValueError("firmware STATE response did not contain motor pulses")
+        try:
+            oe = int(state.get("oe", 1))
+        except (TypeError, ValueError):
+            oe = 1 if str(state.get("oe", "")).upper() == "HIGH" else 0
+        coupling = int(state.get("shoulder_coupling", self.odometry.shoulder_coupling))
+        if coupling in (-1, 1):
+            self.odometry.set_shoulder_coupling(coupling)
+        return {"pulses": pulses, "oe": oe, "shoulder_coupling": coupling}
+
+    @staticmethod
+    def _ack_matches(reply, expected: str) -> bool:
+        if isinstance(reply, (str, bytes, bytearray)):
+            try:
+                reply = json.loads(reply)
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                return False
+        return isinstance(reply, dict) and any(
+            reply.get(key) == expected for key in ("ack", "status", "event")
+        )
+
+    def _wait_for_ack(self, expected: str, timeout_s: float = 1.0) -> bool:
+        wait_ack = getattr(self.transport, "wait_ack", None)
+        if callable(wait_ack):
+            return self._ack_matches(wait_ack(expected, timeout=timeout_s), expected)
+        rx_queue = getattr(self.transport, "rx_queue", None)
+        if rx_queue is None:
+            return False
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            try:
+                reply = rx_queue.get(timeout=remaining)
+            except queue.Empty:
+                return False
+            if self._ack_matches(reply, expected):
+                return True
+
     def read_firmware_state(self) -> dict:
         """Query firmware-owned servo pulse targets without consulting vision."""
         if self.transport is None:
             raise RuntimeError("serial transport is not connected")
         rx_queue = getattr(self.transport, "rx_queue", None)
-        if rx_queue is None or not callable(getattr(rx_queue, "get", None)):
+        wait_ack = getattr(self.transport, "wait_ack", None)
+        dispatched = callable(wait_ack)
+        reply_queue = getattr(self.transport, "_reply_queue", None) if dispatched else None
+        response_queue = reply_queue if dispatched else rx_queue
+        if not dispatched and (
+            rx_queue is None or not callable(getattr(rx_queue, "get", None))
+        ):
             raise RuntimeError("transport does not expose a response queue")
 
-        deadline = time.monotonic() + 1.0
-        self._send("Q")
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("firmware STATE response timed out")
-            try:
-                raw = rx_queue.get(timeout=remaining)
-            except queue.Empty as exc:
-                raise TimeoutError("firmware STATE response timed out") from exc
-            try:
-                state = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
-            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-                continue
-            if not isinstance(state, dict) or state.get("status") != "STATE":
+        self._drain_replies(response_queue, timeout_s=0.15)
+        for attempt in range(2):
+            if attempt:
+                time.sleep(0.2)
+                self._drain_replies(response_queue, timeout_s=0.15)
+            self._send("Q")
+            if dispatched:
+                # ArmController.wait_ack can resend its last command itself on
+                # its first timeout. Let this method own the single 200 ms retry.
+                if getattr(self.transport, "_first_wait_done", None) is False:
+                    self.transport._first_wait_done = True
+                raw = wait_ack("STATE", timeout=2.0)
+                state = self._firmware_state_from_reply(raw)
+                if state is not None:
+                    return state
                 continue
 
-            pulses: dict[int, int] = {}
-            motors = state.get("motors", state.get("ch", []))
-            for item in motors if isinstance(motors, list) else []:
-                if not isinstance(item, dict):
-                    continue
-                motor = item.get("m")
-                channel = item.get("ch", item.get("c"))
-                if motor is None and channel is not None:
-                    motor = int(channel) + 1
-                pulse = item.get("pulse", item.get("p"))
-                if motor is not None and pulse is not None:
-                    pulses[int(motor)] = int(pulse)
-            if not pulses:
-                raise ValueError("firmware STATE response did not contain motor pulses")
-            try:
-                oe = int(state.get("oe", 1))
-            except (TypeError, ValueError):
-                oe = 1 if str(state.get("oe", "")).upper() == "HIGH" else 0
-            coupling = int(state.get("shoulder_coupling", self.odometry.shoulder_coupling))
-            if coupling in (-1, 1):
-                self.odometry.set_shoulder_coupling(coupling)
-            return {"pulses": pulses, "oe": oe, "shoulder_coupling": coupling}
+            deadline = time.monotonic() + 2.0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    raw = rx_queue.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                state = self._firmware_state_from_reply(raw)
+                if state is not None:
+                    return state
+        raise TimeoutError("firmware STATE response timed out")
 
     def apply_pulse_delta(self, motor: int, delta_pulse: int) -> int:
         """Move a firmware-referenced pulse target, mirroring the shoulder pair."""
+        self._last_pulse_acknowledged = False
         motor = int(motor)
         if motor < 1 or motor > 7:
             raise ValueError("motor must be 1..7")
@@ -253,8 +327,11 @@ class ClosedLoopArmController:
             maximum = int(round(float(calibration["pulse_max"])))
             target = max(minimum, min(maximum, int(pulses[target_motor]) + delta))
             self._send_pulse(target_motor, target)
+            if not self._wait_for_ack("P_OK", timeout_s=1.0):
+                raise TimeoutError("firmware P response timed out")
             if target_motor == motor:
                 result_pulse = target
+        self._last_pulse_acknowledged = True
         return int(result_pulse)
 
     def move_delta_openloop(self, joint_index: int, delta_deg: float,
@@ -289,6 +366,7 @@ class ClosedLoopArmController:
                 "ok": False,
                 "reason": str(exc),
                 "verified": False,
+                "pulse_acknowledged": self._last_pulse_acknowledged,
                 "commanded_deg": commanded_deg,
                 "measured_deg": None,
                 "drift_deg": None,
@@ -308,6 +386,7 @@ class ClosedLoopArmController:
             "ok": bool(ok),
             "reason": "verified" if ok and verified else ("unverified" if ok else "drift"),
             "verified": verified,
+            "pulse_acknowledged": self._last_pulse_acknowledged,
             "commanded_deg": float(commanded_deg),
             "measured_deg": None if measured_deg is None else float(measured_deg),
             "drift_deg": None if drift_deg is None else float(drift_deg),
@@ -333,16 +412,19 @@ class ClosedLoopArmController:
         if not current.get("valid"):
             return {"ok": False, "reason": "invalid_start_pose"}
         start_thetas = [float(value) for value in current["thetas_deg"][:6]]
+        moves = []
         for joint_index in range(6):
             delta = _wrap_deg(float(target_thetas[joint_index]) - start_thetas[joint_index])
             if abs(delta) < 1e-9:
                 continue
             result = self.move_delta_openloop(joint_index, delta, settle_s=settle_s)
+            moves.append({**result, "joint_index": joint_index})
             if not result.get("ok") and result.get("reason") != "drift":
                 return {
                     "ok": False,
                     "reason": result.get("reason", "move_failed"),
                     "target_mm": target_mm,
+                    "moves": moves,
                 }
 
         measured = self.read_state(wait_fresh=True, timeout_s=1.0)
@@ -354,6 +436,7 @@ class ClosedLoopArmController:
                 "measured_mm": None,
                 "error_mm": None,
                 "thetas": None,
+                "moves": moves,
             }
         thetas = [float(value) for value in measured["thetas_deg"][:6]]
         fk = arm.forward_kinematics(thetas)
@@ -370,6 +453,7 @@ class ClosedLoopArmController:
             "measured_mm": measured_mm,
             "error_mm": float(error_mm),
             "thetas": thetas,
+            "moves": moves,
         }
 
     def _preload_pulses(self, thetas: list[float]) -> None:

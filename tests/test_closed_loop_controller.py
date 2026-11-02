@@ -331,6 +331,80 @@ class FirmwareStateTransport(FakeTransport):
         if command.startswith("P"):
             motor_text, pulse_text = command[1:].split(":", 1)
             self.pulses[int(motor_text)] = int(pulse_text)
+            self.rx_queue.put(json.dumps({"ack": "P_OK"}))
+
+
+class DispatcherTransport:
+    """ArmController-like transport whose dispatcher owns the raw queue."""
+
+    def __init__(self):
+        self.rx_queue = queue.Queue()
+        self._reply_queue = queue.Queue()
+        self._stop = False
+        import threading
+
+        self._dispatcher = threading.Thread(target=self._dispatch, daemon=True)
+        self._dispatcher.start()
+
+    def _dispatch(self):
+        while not self._stop:
+            try:
+                raw = self.rx_queue.get(timeout=0.02)
+            except queue.Empty:
+                continue
+            self._reply_queue.put(json.loads(raw))
+
+    def send_line(self, command):
+        if command == "Q":
+            self.rx_queue.put(json.dumps({
+                "status": "STATE",
+                "oe": 1,
+                "shoulder_coupling": 1,
+                "motors": [{"m": motor, "pulse": 300 + motor}
+                           for motor in range(1, 8)],
+            }))
+
+    def wait_ack(self, expected, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        pending = []
+        found = None
+        while time.monotonic() < deadline and found is None:
+            try:
+                item = self._reply_queue.get(timeout=min(0.02, deadline - time.monotonic()))
+            except queue.Empty:
+                continue
+            if isinstance(item, dict) and item.get("status") == expected:
+                found = item
+            else:
+                pending.append(item)
+        for item in pending:
+            self._reply_queue.put(item)
+        return found
+
+    def close(self):
+        self._stop = True
+        self._dispatcher.join(timeout=0.2)
+
+
+class RetryStateTransport:
+    def __init__(self, successful_queries=2):
+        self.rx_queue = queue.Queue()
+        self.successful_queries = successful_queries
+        self.query_count = 0
+        self.commands = []
+
+    def send_line(self, command):
+        self.commands.append(command)
+        if command == "Q":
+            self.query_count += 1
+            if self.query_count >= self.successful_queries:
+                self.rx_queue.put(json.dumps({
+                    "status": "STATE",
+                    "oe": 1,
+                    "shoulder_coupling": 1,
+                    "motors": [{"m": motor, "pulse": 300 + motor}
+                               for motor in range(1, 8)],
+                }))
 
 
 def test_apply_pulse_delta_clamps_and_mirrors_motor_six():
@@ -368,6 +442,46 @@ def test_apply_pulse_delta_mirrors_motor_six_with_positive_coupling():
     assert transport.pulses[6] == 325
     assert transport.pulses[5] == 225
     assert transport.commands[-2:] == ["P6:325", "P5:225"]
+
+
+def test_read_firmware_state_uses_dispatcher_reply_queue():
+    transport = DispatcherTransport()
+    transport._reply_queue.put({"ack": "P_OK"})
+    controller = ClosedLoopArmController(transport=transport)
+    try:
+        state = controller.read_firmware_state()
+    finally:
+        transport.close()
+
+    assert state["pulses"] == {motor: 300 + motor for motor in range(1, 8)}
+    assert state["oe"] == 1
+    assert state["shoulder_coupling"] == 1
+    assert transport.rx_queue.empty()
+
+
+def test_read_firmware_state_retries_one_timed_out_query():
+    transport = RetryStateTransport(successful_queries=2)
+    controller = ClosedLoopArmController(transport=transport)
+
+    state = controller.read_firmware_state()
+
+    assert state["pulses"][7] == 307
+    assert transport.commands == ["Q", "Q"]
+
+
+def test_openloop_step_returns_documented_reason_when_both_queries_time_out():
+    transport = RetryStateTransport(successful_queries=3)
+    controller = ClosedLoopArmController(transport=transport)
+    controller.read_state = lambda **_kwargs: {
+        "valid": True,
+        "thetas_deg": [0, 90, 0, 0, 0, 50],
+    }
+
+    result = controller.move_delta_openloop(0, 10, settle_s=0)
+
+    assert result["ok"] is False
+    assert result["reason"] == "firmware STATE response timed out"
+    assert transport.commands.count("Q") == 2
 
 
 def test_move_to_xyz_openloop_refuses_unreachable_target_without_pulses():
