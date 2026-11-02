@@ -234,6 +234,25 @@ def test_geometric_fallback_preserves_gripper_vision_proxies():
     assert result["gripper_open_percent"] == 35.0
 
 
+def test_encoder_always_returns_gripper_proxy_keys():
+    encoder = VirtualOpticalEncoder()
+    class DummyAnalyzer:
+        def analyze(self, _frame):
+            return {
+                "thetas_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 50.0],
+                "gripper_width_px": 36.5,
+                "gripper_open_percent": 30.4,
+            }
+    encoder.fallback_analyzer = DummyAnalyzer()
+    encoder._detect_aruco = lambda _frame: {}
+    result = encoder.read_positions(np.zeros((8, 8, 3), dtype=np.uint8), timestamp_s=2.0)
+    assert "gripper_width_px" in result
+    assert "gripper_open_percent" in result
+    assert isinstance(result["gripper_width_px"], float)
+    assert isinstance(result["gripper_open_percent"], float)
+
+
+
 def test_motor2_8deg_noise_oe_high_stays_passed():
     encoder = VirtualOpticalEncoder()
     encoder.set_oe_state(oe_high=True, active_command=False)

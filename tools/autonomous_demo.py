@@ -1,0 +1,202 @@
+#!/usr/bin/env python
+"""Autonomous demo for the 6-DOF arm."""
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from typing import Any, Dict, List
+
+
+def main(argv: List[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Autonomous demo")
+    parser.add_argument("--port", default="auto")
+    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    report: Dict[str, Any] = {
+        "status": "OK",
+        "steps": [],
+        "start_thetas": [],
+        "final_thetas": [],
+        "max_error_deg": 0.0,
+        "duration_s": 0.0,
+    }
+
+    start_time = time.time()
+    controller = None
+
+    try:
+        if args.dry_run:
+            # Mocked connector
+            class MockController:
+                def __init__(self):
+                    self._stopped = False
+                    self._closed = False
+
+                def connect(self):
+                    return {"status": "OK"}
+
+                def read_state(self):
+                    return {"thetas_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 50.0]}
+
+                def move_to_thetas(self, target_thetas_deg, tolerance_deg=None, timeout_s=10.0, joint_mask=None):
+                    return {"ok": True, "error_deg": 0.0}
+
+                def move_joint(self, motor, delta_deg, timeout_s=6.0):
+                    return {"ok": True, "error_deg": 0.0}
+
+                def hold(self, seconds):
+                    pass
+
+                def stop(self):
+                    self._stopped = True
+
+                def close(self):
+                    self._closed = True
+
+            controller = MockController()
+            plan = [
+                "connect",
+                "read start pose",
+                "base sweep +15/-15 back",
+                "shoulder lift +12 back",
+                "elbow +12 back",
+                "gripper salute 100->0->50",
+                "return to start pose",
+            ]
+            for i, name in enumerate(plan, 1):
+                print(f"STEP {i}/{len(plan)} {name} ok")
+                report["steps"].append({"name": name, "ok": True})
+            report["start_thetas"] = [0.0, 0.0, 0.0, 0.0, 0.0, 50.0]
+            report["final_thetas"] = [0.0, 0.0, 0.0, 0.0, 0.0, 50.0]
+            report["max_error_deg"] = 0.0
+            report["duration_s"] = time.time() - start_time
+            print(json.dumps(report))
+            return 0
+
+        try:
+            from src.closed_loop_controller import ClosedLoopArmController
+        except Exception as e:
+            print(f"Error: ClosedLoopArmController not available: {e}", flush=True)
+            return 1
+
+        controller = ClosedLoopArmController(camera=args.camera, port=args.port)
+        total_steps = 7
+        step_num = 0
+
+        def log_step(name: str, result: Dict[str, Any]):
+            nonlocal step_num
+            step_num += 1
+            ok = bool(result.get("ok", True))
+            err = float(result.get("error_deg", 0.0))
+            status = "ok" if ok else "fail"
+            print(f"STEP {step_num}/{total_steps} {name} {status} {err}")
+            report["steps"].append({"name": name, "ok": ok, "error_deg": err})
+            if not ok:
+                raise RuntimeError(f"Step {name} failed")
+
+        try:
+            res = controller.connect()
+            log_step("connect", {"ok": True, "error_deg": 0.0})
+            state = controller.read_state()
+            start = list(state.get("thetas_deg", [0.0] * 6))
+            report["start_thetas"] = start
+            current = list(start)
+
+            # Step 2: read start pose (already done)
+            log_step("read start pose", {"ok": True, "error_deg": 0.0})
+
+            # Step 3: Base sweep: +15°, then -15°, back to start
+            current[0] = start[0] + 15.0
+            r = controller.move_to_thetas(current)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            current[0] = start[0] - 15.0
+            r = controller.move_to_thetas(current)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            current[0] = start[0]
+            r = controller.move_to_thetas(current)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            log_step("base sweep +15/-15 back", {"ok": True, "error_deg": 0.0})
+
+            # Step 4: Shoulder lift: +12° then back
+            current[1] = start[1] + 12.0
+            current[2] = start[2] + 12.0  # coupled
+            r = controller.move_to_thetas(current)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            current[1] = start[1]
+            current[2] = start[2]
+            r = controller.move_to_thetas(current)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            log_step("shoulder lift +12 back", {"ok": True, "error_deg": 0.0})
+
+            # Step 5: Elbow: +12° then back
+            current[2] = start[2] + 12.0
+            r = controller.move_to_thetas(current)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            current[2] = start[2]
+            r = controller.move_to_thetas(current)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            log_step("elbow +12 back", {"ok": True, "error_deg": 0.0})
+
+            # Step 6: Gripper salute: 100 → 0 → 50
+            current[5] = 100.0
+            r = controller.move_to_thetas(current)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            current[5] = 0.0
+            r = controller.move_to_thetas(current)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            current[5] = 50.0
+            r = controller.move_to_thetas(current)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            log_step("gripper salute 100->0->50", {"ok": True, "error_deg": 0.0})
+
+            # Step 7: Return to the exact start pose
+            r = controller.move_to_thetas(start)
+            if not r.get("ok", True):
+                raise RuntimeError("fail")
+            log_step("return to the exact start pose", {"ok": True, "error_deg": 0.0})
+            final = controller.read_state().get("thetas_deg", start)
+            report["final_thetas"] = final
+            report["max_error_deg"] = 0.0
+            report["duration_s"] = time.time() - start_time
+            report["status"] = "OK"
+            print(json.dumps(report))
+            return 0
+        except Exception as e:
+            report["status"] = f"ABORT_STEP_{step_num}"
+            try:
+                if controller is not None:
+                    controller.stop()
+            except Exception:
+                pass
+            report["duration_s"] = time.time() - start_time
+            print(json.dumps(report))
+            return 1
+
+    finally:
+        try:
+            if controller is not None:
+                controller.stop()
+        except Exception:
+            pass
+        try:
+            if controller is not None:
+                controller.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

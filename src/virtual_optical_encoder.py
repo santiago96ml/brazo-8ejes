@@ -386,7 +386,7 @@ class VirtualOpticalEncoder:
                 thetas_raw[4] = _wrap_deg(m4["angle_deg"] - float(self.home_offsets_deg.get("theta5", 0.0)))
             else:
                 thetas_raw[4] = 0.0
-            # Gripper
+            # Gripper - try to get from analyzer if available
             m5 = markers.get(5)
             m6 = markers.get(6)
             if m5 is not None and m6 is not None:
@@ -402,6 +402,16 @@ class VirtualOpticalEncoder:
             else:
                 thetas_raw[5] = 0.0
                 grip_opening_mm = 0.0
+            # Also try to get gripper proxy from analyzer if present
+            if self.fallback_analyzer is not None:
+                try:
+                    res = self.fallback_analyzer.analyze(frame_bgr)
+                    if res.get("gripper_width_px") is not None:
+                        gripper_width_px = res.get("gripper_width_px")
+                    if res.get("gripper_open_percent") is not None:
+                        gripper_open_percent = res.get("gripper_open_percent")
+                except Exception:
+                    pass
         else:
             # Fallback to geometric
             mode_used = "geometric_fallback"

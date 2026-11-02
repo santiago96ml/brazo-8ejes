@@ -918,6 +918,26 @@ class ArmVisionAnalyzer:
             ]
             grip_width_px = None
             grip_open_percent = None
+            # Compute gripper proxy for any real-arm contour when keypoints exist
+            try:
+                if (
+                    "gripper_tip" in locals()
+                    and "wrist_roll" in locals()
+                    and blue_area >= 25000
+                ):
+                    grip_width_px = self._stabilize_gripper_width(
+                        self._measure_gripper_width(sel_mask, wrist_roll, tip)
+                    )
+                    if grip_width_px is not None:
+                        grip_open_percent = min(
+                            100.0,
+                            max(0.0, 100.0 * grip_width_px / self.gripper_max_width_px),
+                        )
+                    else:
+                        grip_open_percent = None
+            except Exception:
+                grip_width_px = None
+                grip_open_percent = None
         kp = {
             "base": (float(base[0]), float(base[1]), 0.8),
             "shoulder": (float(shoulder[0]), float(shoulder[1]), 0.8),
