@@ -4,8 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import time
 from typing import Any, Dict, List
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 
 def main(argv: List[str] | None = None) -> int:
